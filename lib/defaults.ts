@@ -402,9 +402,10 @@ Head to CandiceOwens.com and use code Candice at checkout. Again, that’s code 
 `;
 
 export const SUGGESTED_PROMPTS = [
-  "Give me a sharp opening monologue about media corrections that come too late.",
-  "Respond to someone saying the official explanation is good enough.",
-  "Explain a suspicion without inventing facts or fake sources.",
-  "Write a clip setup where an official contradicts himself.",
-  "Draft a serious response about tragedy being exploited for politics."
+  "What do you think is really going on with Charlie Kirk's assassination?",
+  "Why are people so afraid of asking questions about Turning Point USA?",
+  "What is your problem with the pro-Israel lobby?",
+  "Do you still support Trump after everything that has happened?",
+  "Why do you think the media keeps calling people conspiracy theorists?",
+  "What should Christians do when institutions are lying to them?"
 ];
