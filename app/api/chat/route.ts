@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { DEFAULT_MODEL } from "@/lib/defaults";
+import { DEFAULT_SYSTEM_PROMPT } from "@/lib/system-prompt";
 
 type ChatRole = "user" | "assistant" | "system";
 
@@ -44,7 +45,6 @@ type OpenRouterMessage = {
 type ChatRequest = {
   model?: string;
   responseMode?: "standard" | "extended";
-  systemPrompt?: string;
   messages?: ChatMessage[];
 };
 
@@ -249,21 +249,13 @@ export async function POST(request: Request) {
       ? body.model.trim()
       : DEFAULT_MODEL;
   const responseMode = body.responseMode === "extended" ? "extended" : "standard";
-  const systemPrompt =
-    typeof body.systemPrompt === "string" ? body.systemPrompt.trim() : "";
+  const systemPrompt = DEFAULT_SYSTEM_PROMPT;
   const clientMessages = Array.isArray(body.messages)
     ? body.messages.filter(isChatMessage)
     : [];
 
   if (!model) {
     return NextResponse.json({ error: "Model is required." }, { status: 400 });
-  }
-
-  if (!systemPrompt) {
-    return NextResponse.json(
-      { error: "System prompt is required." },
-      { status: 400 }
-    );
   }
 
   if (clientMessages.length === 0) {

@@ -3,7 +3,7 @@
 import { FormEvent, KeyboardEvent, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { DEFAULT_MODEL, DEFAULT_SYSTEM_PROMPT, SUGGESTED_PROMPTS } from "@/lib/defaults";
+import { DEFAULT_MODEL, SUGGESTED_PROMPTS } from "@/lib/defaults";
 
 type Role = "user" | "assistant";
 
@@ -37,7 +37,6 @@ type Conversation = {
   createdAt: string;
   updatedAt: string;
   messages: Message[];
-  systemPrompt: string;
   model: string;
   manualTitle?: boolean;
 };
@@ -86,7 +85,6 @@ const STORAGE_KEY = "candace-chat-conversations-v1";
 const SIDEBAR_STORAGE_KEY = "candace-chat-sidebar-v1";
 const CLIENT_MAX_MESSAGES = 512;
 const CLIENT_MAX_MESSAGE_CHARS = 1_000_000;
-const CLIENT_MAX_SYSTEM_PROMPT_CHARS = 300_000;
 const CLIENT_MAX_REQUEST_CHARS = 3_600_000;
 const MAX_TEXT_ATTACHMENT_CHARS = 500_000;
 const SUPPORTED_IMAGE_TYPES = new Set([
@@ -132,14 +130,8 @@ function sortConversations(conversations: Conversation[]) {
   );
 }
 
-function trimMessagesForRequest(messages: Message[], systemPrompt: string) {
-  if (systemPrompt.length > CLIENT_MAX_SYSTEM_PROMPT_CHARS) {
-    throw new Error(
-      `System prompt is too large. Keep it under ${CLIENT_MAX_SYSTEM_PROMPT_CHARS.toLocaleString()} characters.`
-    );
-  }
-
-  const budget = CLIENT_MAX_REQUEST_CHARS - systemPrompt.length;
+function trimMessagesForRequest(messages: Message[]) {
+  const budget = CLIENT_MAX_REQUEST_CHARS;
   const selected: Message[] = [];
   let usedCharacters = 0;
 
@@ -276,10 +268,18 @@ function isConversation(value: unknown): value is Conversation {
     typeof candidate.title === "string" &&
     typeof candidate.createdAt === "string" &&
     typeof candidate.updatedAt === "string" &&
-    typeof candidate.systemPrompt === "string" &&
     typeof candidate.model === "string" &&
     Array.isArray(candidate.messages)
   );
+}
+
+function stripPrivateConversationFields(conversation: Conversation) {
+  const {
+    systemPrompt: _systemPrompt,
+    ...publicConversation
+  } = conversation as Conversation & { systemPrompt?: string };
+
+  return publicConversation;
 }
 
 export default function ChatApp() {
@@ -290,14 +290,10 @@ export default function ChatApp() {
   const [input, setInput] = useState("");
   const [pendingImages, setPendingImages] = useState<ImageAttachment[]>([]);
   const [pendingPdfs, setPendingPdfs] = useState<PdfAttachment[]>([]);
-  const [systemPrompt, setSystemPrompt] = useState(DEFAULT_SYSTEM_PROMPT);
-  const [draftPrompt, setDraftPrompt] = useState(DEFAULT_SYSTEM_PROMPT);
   const [model, setModel] = useState(DEFAULT_MODEL);
-  const [draftModel, setDraftModel] = useState(DEFAULT_MODEL);
   const [requestMode, setRequestMode] = useState<RequestMode>("standard");
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
-  const [settingsOpen, setSettingsOpen] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [isReadingFiles, setIsReadingFiles] = useState(false);
@@ -327,7 +323,9 @@ export default function ChatApp() {
       const storedSidebar = window.localStorage.getItem(SIDEBAR_STORAGE_KEY);
       const parsed = stored ? (JSON.parse(stored) as unknown) : [];
       const saved = Array.isArray(parsed)
-        ? sortConversations(parsed.filter(isConversation))
+        ? sortConversations(
+            parsed.filter(isConversation).map(stripPrivateConversationFields)
+          )
         : [];
 
       if (storedSidebar) {
@@ -339,10 +337,7 @@ export default function ChatApp() {
         setConversations(saved);
         setActiveConversationId(latest.id);
         setMessages(latest.messages);
-        setSystemPrompt(latest.systemPrompt || DEFAULT_SYSTEM_PROMPT);
-        setDraftPrompt(latest.systemPrompt || DEFAULT_SYSTEM_PROMPT);
         setModel(latest.model || DEFAULT_MODEL);
-        setDraftModel(latest.model || DEFAULT_MODEL);
         setLastUserMessage(
           [...latest.messages].reverse().find((message) => message.role === "user")
             ?.content || null
@@ -377,13 +372,6 @@ export default function ChatApp() {
   }, [messages, isSending]);
 
   useEffect(() => {
-    if (settingsOpen) {
-      setDraftPrompt(systemPrompt);
-      setDraftModel(model);
-    }
-  }, [settingsOpen, systemPrompt, model]);
-
-  useEffect(() => {
     return () => {
       recognitionRef.current?.abort();
     };
@@ -407,7 +395,6 @@ export default function ChatApp() {
         createdAt: existing?.createdAt || now,
         updatedAt: now,
         messages: nextMessages,
-        systemPrompt,
         model,
         manualTitle: existing?.manualTitle
       };
@@ -424,10 +411,7 @@ export default function ChatApp() {
   function openConversation(conversation: Conversation) {
     setActiveConversationId(conversation.id);
     setMessages(conversation.messages);
-    setSystemPrompt(conversation.systemPrompt || DEFAULT_SYSTEM_PROMPT);
-    setDraftPrompt(conversation.systemPrompt || DEFAULT_SYSTEM_PROMPT);
     setModel(conversation.model || DEFAULT_MODEL);
-    setDraftModel(conversation.model || DEFAULT_MODEL);
     setInput("");
     setPendingImages([]);
     setPendingPdfs([]);
@@ -447,7 +431,6 @@ export default function ChatApp() {
       createdAt: now,
       updatedAt: now,
       messages: [],
-      systemPrompt,
       model
     };
 
@@ -551,10 +534,7 @@ export default function ChatApp() {
     }
 
     try {
-      const trimmedRequest = trimMessagesForRequest(
-        optimisticMessages,
-        systemPrompt
-      );
+      const trimmedRequest = trimMessagesForRequest(optimisticMessages);
       const apiMessages = trimmedRequest.messages.map((message) => ({
         role: message.role,
         content: message.content,
@@ -584,7 +564,6 @@ export default function ChatApp() {
         body: JSON.stringify({
           model,
           responseMode: requestMode,
-          systemPrompt,
           messages: apiMessages
         })
       });
@@ -926,39 +905,6 @@ export default function ChatApp() {
     recognition.start();
   }
 
-  function saveSettings() {
-    const nextPrompt = draftPrompt.trim() || DEFAULT_SYSTEM_PROMPT;
-    const nextModel = draftModel.trim() || DEFAULT_MODEL;
-    setSystemPrompt(nextPrompt);
-    setModel(nextModel);
-
-    setConversations((current) => {
-      const now = new Date().toISOString();
-      const existing = current.find(
-        (conversation) => conversation.id === activeConversationId
-      );
-      const nextConversation: Conversation = {
-        id: activeConversationId,
-        title: existing?.title || titleFromMessages(messages),
-        createdAt: existing?.createdAt || now,
-        updatedAt: now,
-        messages,
-        systemPrompt: nextPrompt,
-        model: nextModel,
-        manualTitle: existing?.manualTitle
-      };
-
-      return sortConversations([
-        nextConversation,
-        ...current.filter(
-          (conversation) => conversation.id !== activeConversationId
-        )
-      ]);
-    });
-
-    setSettingsOpen(false);
-  }
-
   function resetChat() {
     startNewChat();
   }
@@ -987,10 +933,6 @@ export default function ChatApp() {
               conversations={conversations}
               activeConversationId={activeConversationId}
               onNewChat={startMobileNewChat}
-              onSettings={() => {
-                setSettingsOpen(true);
-                setMobileSidebarOpen(false);
-              }}
               onOpenConversation={openMobileConversation}
               onRenameConversation={renameConversation}
               onDeleteConversation={deleteConversation}
@@ -1007,7 +949,6 @@ export default function ChatApp() {
             conversations={conversations}
             activeConversationId={activeConversationId}
             onNewChat={resetChat}
-            onSettings={() => setSettingsOpen(true)}
             onOpenConversation={openConversation}
             onRenameConversation={renameConversation}
             onDeleteConversation={deleteConversation}
@@ -1020,7 +961,6 @@ export default function ChatApp() {
       <section className="relative flex min-w-0 flex-1 flex-col bg-white">
           <Header
             model={model}
-            onOpenSettings={() => setSettingsOpen(true)}
             onReset={resetChat}
             onShare={shareConversation}
             canShare={messages.length > 0}
@@ -1094,6 +1034,8 @@ export default function ChatApp() {
             <input
               ref={fileInputRef}
               type="file"
+              aria-label="Attach files"
+              title="Attach files"
               className="hidden"
               multiple
               accept=".csv,.gif,.html,.jpeg,.jpg,.json,.log,.md,.pdf,.png,.ts,.tsx,.txt,.webp,.xml,text/*,application/json,application/pdf,application/xml,image/gif,image/jpeg,image/png,image/webp"
@@ -1103,19 +1045,6 @@ export default function ChatApp() {
         </div>
       </section>
 
-      <SettingsPanel
-        open={settingsOpen}
-        draftPrompt={draftPrompt}
-        draftModel={draftModel}
-        onPromptChange={setDraftPrompt}
-        onModelChange={setDraftModel}
-        onClose={() => setSettingsOpen(false)}
-        onSave={saveSettings}
-        onReset={() => {
-          setDraftPrompt(DEFAULT_SYSTEM_PROMPT);
-          setDraftModel(DEFAULT_MODEL);
-        }}
-      />
     </main>
   );
 }
@@ -1124,7 +1053,6 @@ function SidebarPanel({
   conversations,
   activeConversationId,
   onNewChat,
-  onSettings,
   onOpenConversation,
   onRenameConversation,
   onDeleteConversation,
@@ -1134,7 +1062,6 @@ function SidebarPanel({
   conversations: Conversation[];
   activeConversationId: string;
   onNewChat: () => void;
-  onSettings: () => void;
   onOpenConversation: (conversation: Conversation) => void;
   onRenameConversation: (id: string) => void;
   onDeleteConversation: (id: string) => void;
@@ -1157,7 +1084,6 @@ function SidebarPanel({
 
       <div className="mt-4 space-y-1">
         <SidebarButton label="New chat" icon="✎" onClick={onNewChat} />
-        <SidebarButton label="Settings" icon="⚙" onClick={onSettings} />
       </div>
 
       <div className="mt-6 px-2 text-xs font-semibold text-[#6b6b6b]">
@@ -1260,7 +1186,6 @@ function SidebarButton({
 
 function Header({
   model,
-  onOpenSettings,
   onReset,
   onShare,
   canShare,
@@ -1270,7 +1195,6 @@ function Header({
   onOpenMobileSidebar
 }: {
   model: string;
-  onOpenSettings: () => void;
   onReset: () => void;
   onShare: () => void;
   canShare: boolean;
@@ -1328,12 +1252,6 @@ function Header({
           title={shareStatus || "Share conversation"}
         >
           {shareStatus || "Share"}
-        </button>
-        <button
-          onClick={onOpenSettings}
-          className="rounded-lg px-3 py-2 text-sm font-medium text-[#444] transition hover:bg-[#f2f2f2] focus:outline-none focus:ring-2 focus:ring-[#d9d9d9]"
-        >
-          •••
         </button>
       </div>
     </header>
@@ -1680,7 +1598,6 @@ function Composer({
             <button
               type="button"
               onClick={onToggleRequestMode}
-              aria-pressed={requestMode === "extended"}
               className={`rounded-full px-3 py-1.5 text-xs font-medium transition focus:outline-none focus:ring-2 focus:ring-[#d9d9d9] ${
                 requestMode === "extended"
                   ? "bg-[#0d0d0d] text-white hover:bg-[#303030]"
@@ -1697,7 +1614,6 @@ function Composer({
               onClick={onToggleVoice}
               className="hidden h-8 w-8 items-center justify-center rounded-full text-[#6f6f6f] transition hover:bg-[#f1f1f1] focus:outline-none focus:ring-2 focus:ring-[#d9d9d9] sm:flex"
               aria-label={isListening ? "Stop voice input" : "Start voice input"}
-              aria-pressed={isListening}
               title={isListening ? "Stop voice input" : "Start voice input"}
             >
               {isListening ? "■" : "◌"}
@@ -1720,101 +1636,3 @@ function Composer({
   );
 }
 
-function SettingsPanel({
-  open,
-  draftPrompt,
-  draftModel,
-  onPromptChange,
-  onModelChange,
-  onClose,
-  onSave,
-  onReset
-}: {
-  open: boolean;
-  draftPrompt: string;
-  draftModel: string;
-  onPromptChange: (value: string) => void;
-  onModelChange: (value: string) => void;
-  onClose: () => void;
-  onSave: () => void;
-  onReset: () => void;
-}) {
-  if (!open) return null;
-
-  return (
-    <div className="fixed inset-0 z-50">
-      <button
-        aria-label="Close settings"
-        className="absolute inset-0 bg-ink/24 backdrop-blur-sm"
-        onClick={onClose}
-      />
-      <aside className="absolute right-0 top-0 flex h-full w-full max-w-2xl flex-col border-l border-line bg-[#fffdf8] shadow-[0_30px_100px_rgba(22,24,29,0.22)] sm:rounded-l-[2rem]">
-        <div className="border-b border-line px-5 py-5 sm:px-7">
-          <div className="flex items-start justify-between gap-4">
-            <div>
-              <p className="text-xs font-extrabold uppercase tracking-[0.22em] text-brand">
-                Settings
-              </p>
-              <h2 className="mt-2 font-display text-4xl font-semibold tracking-tight">
-                Tune the assistant.
-              </h2>
-              <p className="mt-2 max-w-xl text-sm leading-6 text-ink/58">
-                The system prompt is sent first on every request, followed by
-                the conversation history.
-              </p>
-            </div>
-            <button
-              onClick={onClose}
-              className="rounded-full border border-line bg-white px-3 py-2 text-sm font-bold text-ink/60 transition hover:text-ink focus:outline-none focus:ring-4 focus:ring-brand/15"
-            >
-              Close
-            </button>
-          </div>
-        </div>
-
-        <div className="scrollbar-soft flex-1 space-y-6 overflow-y-auto px-5 py-6 sm:px-7">
-          <label className="block">
-            <span className="text-sm font-bold text-ink">Model</span>
-            <input
-              value={draftModel}
-              onChange={(event) => onModelChange(event.target.value)}
-              className="mt-2 w-full rounded-2xl border border-line bg-white px-4 py-3 font-mono text-sm text-ink outline-none transition focus:border-brand/40 focus:ring-4 focus:ring-brand/10"
-            />
-          </label>
-
-          <label className="block">
-            <span className="text-sm font-bold text-ink">System prompt</span>
-            <textarea
-              value={draftPrompt}
-              onChange={(event) => onPromptChange(event.target.value)}
-              className="scrollbar-soft mt-2 min-h-[430px] w-full resize-none rounded-2xl border border-line bg-white px-4 py-4 text-sm leading-6 text-ink outline-none transition focus:border-brand/40 focus:ring-4 focus:ring-brand/10"
-            />
-          </label>
-        </div>
-
-        <div className="flex flex-col-reverse gap-3 border-t border-line bg-white/70 px-5 py-4 sm:flex-row sm:justify-between sm:px-7">
-          <button
-            onClick={onReset}
-            className="rounded-full border border-line bg-white px-5 py-3 text-sm font-bold text-ink/72 transition hover:-translate-y-0.5 hover:text-ink focus:outline-none focus:ring-4 focus:ring-brand/15"
-          >
-            Reset defaults
-          </button>
-          <div className="flex gap-3">
-            <button
-              onClick={onClose}
-              className="flex-1 rounded-full border border-line bg-white px-5 py-3 text-sm font-bold text-ink/72 transition hover:-translate-y-0.5 hover:text-ink focus:outline-none focus:ring-4 focus:ring-brand/15 sm:flex-none"
-            >
-              Cancel
-            </button>
-            <button
-              onClick={onSave}
-              className="flex-1 rounded-full bg-ink px-5 py-3 text-sm font-extrabold text-white shadow-float transition hover:-translate-y-0.5 hover:bg-brand-ink focus:outline-none focus:ring-4 focus:ring-brand/20 sm:flex-none"
-            >
-              Save settings
-            </button>
-          </div>
-        </div>
-      </aside>
-    </div>
-  );
-}
