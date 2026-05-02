@@ -80,7 +80,8 @@ type SpeechRecognitionWindow = Window & {
   webkitSpeechRecognition?: new () => SpeechRecognitionLike;
 };
 
-const exampleTitle = "Candace Voice Chat";
+const exampleTitle = "Candace Chat";
+const visibleModelName = "~gpt-candace-owens";
 const STORAGE_KEY = "candace-chat-conversations-v1";
 const SIDEBAR_STORAGE_KEY = "candace-chat-sidebar-v1";
 const CLIENT_MAX_MESSAGES = 512;
@@ -960,7 +961,6 @@ export default function ChatApp() {
 
       <section className="relative flex min-w-0 flex-1 flex-col bg-white">
           <Header
-            model={model}
             onReset={resetChat}
             onShare={shareConversation}
             canShare={messages.length > 0}
@@ -1185,7 +1185,6 @@ function SidebarButton({
 }
 
 function Header({
-  model,
   onReset,
   onShare,
   canShare,
@@ -1194,7 +1193,6 @@ function Header({
   onToggleSidebar,
   onOpenMobileSidebar
 }: {
-  model: string;
   onReset: () => void;
   onShare: () => void;
   canShare: boolean;
@@ -1235,7 +1233,9 @@ function Header({
             Candace
           </p>
           <span className="text-[#c7c7c7]">•</span>
-          <p className="truncate font-mono text-xs text-[#777]">{model}</p>
+          <p className="truncate font-mono text-xs text-[#777]">
+            {visibleModelName}
+          </p>
         </div>
       </div>
       <div className="flex shrink-0 items-center gap-2">
