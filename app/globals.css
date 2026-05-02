@@ -1,0 +1,100 @@
+@import url("https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Newsreader:opsz,wght@6..72,500;6..72,650&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --font-sans: "Manrope";
+  --font-display: "Newsreader";
+  --background: #fbfaf7;
+  --foreground: #16181d;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  min-height: 100%;
+  background: var(--background);
+}
+
+body {
+  min-height: 100vh;
+  margin: 0;
+  color: var(--foreground);
+  background:
+    radial-gradient(circle at 18% 16%, rgba(36, 88, 211, 0.10), transparent 28rem),
+    radial-gradient(circle at 88% 12%, rgba(196, 87, 26, 0.10), transparent 26rem),
+    linear-gradient(135deg, #fffdf8 0%, #f8f3ea 52%, #fbfaf7 100%);
+  font-family: var(--font-sans), sans-serif;
+}
+
+body::before {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  content: "";
+  background-image:
+    linear-gradient(rgba(22, 24, 29, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(22, 24, 29, 0.035) 1px, transparent 1px);
+  background-size: 44px 44px;
+  mask-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.68), transparent 78%);
+}
+
+::selection {
+  color: #ffffff;
+  background: #2458d3;
+}
+
+button,
+textarea,
+input {
+  font: inherit;
+}
+
+button {
+  -webkit-tap-highlight-color: transparent;
+}
+
+.scrollbar-soft {
+  scrollbar-width: thin;
+  scrollbar-color: #d5cbbd transparent;
+}
+
+.scrollbar-soft::-webkit-scrollbar {
+  width: 10px;
+}
+
+.scrollbar-soft::-webkit-scrollbar-thumb {
+  background: #d5cbbd;
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background-clip: content-box;
+}
+
+.message-content p {
+  margin: 0 0 0.8rem;
+}
+
+.message-content p:last-child {
+  margin-bottom: 0;
+}
+
+.message-content code {
+  border: 1px solid rgba(36, 88, 211, 0.16);
+  border-radius: 0.45rem;
+  background: rgba(36, 88, 211, 0.06);
+  padding: 0.05rem 0.35rem;
+}
+
+.message-content pre {
+  overflow: auto;
+  border: 1px solid rgba(22, 24, 29, 0.10);
+  border-radius: 1rem;
+  background: #f8f4ec;
+  color: #16181d;
+  padding: 1rem;
+}

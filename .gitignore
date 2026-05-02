@@ -1,0 +1,22 @@
+node_modules/
+.next/
+out/
+
+.env
+.env*.local
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+*.tsbuildinfo
+
+# Source corpus and prompt-research tooling; not needed for the deployed chat app.
+candace-owens-transcripts/
+scripts/
+voice_corpus_report.txt
+voice_patterns.json
+voice_examples.json
+voice_eval_prompts.md
+systemprompt.md
