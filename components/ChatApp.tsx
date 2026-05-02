@@ -88,6 +88,9 @@ const CLIENT_MAX_MESSAGES = 512;
 const CLIENT_MAX_MESSAGE_CHARS = 1_000_000;
 const CLIENT_MAX_REQUEST_CHARS = 3_600_000;
 const MAX_TEXT_ATTACHMENT_CHARS = 500_000;
+const MAX_IMAGE_DATA_URL_CHARS = 850_000;
+const IMAGE_MAX_DIMENSION = 1400;
+const IMAGE_COMPRESSION_QUALITY = 0.82;
 const SUPPORTED_IMAGE_TYPES = new Set([
   "image/png",
   "image/jpeg",
@@ -151,7 +154,7 @@ function trimMessagesForRequest(messages: Message[]) {
 
     if (messageSize > CLIENT_MAX_MESSAGE_CHARS) {
       throw new Error(
-        `One message plus its attachments is too large. Keep each message under ${CLIENT_MAX_MESSAGE_CHARS.toLocaleString()} characters.`
+        `That attachment is too large to send. Try a smaller image, a public image URL, or a smaller PDF.`
       );
     }
 
@@ -243,6 +246,49 @@ function readFileAsDataUrl(file: File) {
     reader.onerror = () => reject(new Error(`Could not read ${file.name}.`));
     reader.readAsDataURL(file);
   });
+}
+
+function loadImage(dataUrl: string) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("Could not process that image."));
+    image.src = dataUrl;
+  });
+}
+
+async function readImageAsDataUrl(file: File) {
+  const originalUrl = await readFileAsDataUrl(file);
+
+  if (
+    originalUrl.length <= MAX_IMAGE_DATA_URL_CHARS ||
+    file.type === "image/gif"
+  ) {
+    return { url: originalUrl, mimeType: file.type };
+  }
+
+  const image = await loadImage(originalUrl);
+  const scale = Math.min(
+    1,
+    IMAGE_MAX_DIMENSION / Math.max(image.naturalWidth, image.naturalHeight)
+  );
+  const width = Math.max(1, Math.round(image.naturalWidth * scale));
+  const height = Math.max(1, Math.round(image.naturalHeight * scale));
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+
+  const context = canvas.getContext("2d");
+  if (!context) return { url: originalUrl, mimeType: file.type };
+
+  context.fillStyle = "#fff";
+  context.fillRect(0, 0, width, height);
+  context.drawImage(image, 0, 0, width, height);
+
+  return {
+    url: canvas.toDataURL("image/jpeg", IMAGE_COMPRESSION_QUALITY),
+    mimeType: "image/jpeg"
+  };
 }
 
 function isPdfUrl(url: URL) {
@@ -715,11 +761,13 @@ export default function ChatApp() {
 
       for (const file of Array.from(files)) {
         if (isImageAttachment(file)) {
+          const image = await readImageAsDataUrl(file);
+
           imageBlocks.push({
             id: uid(),
             name: file.name,
-            mimeType: file.type,
-            url: await readFileAsDataUrl(file)
+            mimeType: image.mimeType,
+            url: image.url
           });
           continue;
         }
@@ -1616,7 +1664,25 @@ function Composer({
               aria-label={isListening ? "Stop voice input" : "Start voice input"}
               title={isListening ? "Stop voice input" : "Start voice input"}
             >
-              {isListening ? "■" : "◌"}
+              {isListening ? (
+                <span className="h-2.5 w-2.5 rounded-[2px] bg-current" />
+              ) : (
+                <svg
+                  aria-hidden="true"
+                  viewBox="0 0 24 24"
+                  className="h-[18px] w-[18px]"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3Z" />
+                  <path d="M19 10v1a7 7 0 0 1-14 0v-1" />
+                  <path d="M12 18v3" />
+                  <path d="M8 21h8" />
+                </svg>
+              )}
             </button>
             <button
               type="submit"

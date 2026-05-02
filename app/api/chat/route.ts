@@ -24,7 +24,7 @@ type OpenRouterContent =
     }
   | {
       type: "image_url";
-      imageUrl: {
+      image_url: {
         url: string;
       };
     }
@@ -173,7 +173,7 @@ function requestLimitError(systemPrompt: string, messages: ChatMessage[]) {
   );
 
   if (oversizedMessage) {
-    return `One message plus its attachments is too large. Keep each message under ${MAX_MESSAGE_CHARS.toLocaleString()} characters.`;
+    return "That attachment is too large to send. Try a smaller image, a public image URL, or a smaller PDF.";
   }
 
   const totalCharacters = systemPrompt.length + contentLength(messages);
@@ -209,7 +209,7 @@ function toOpenRouterMessage(message: ChatMessage): OpenRouterMessage {
       { type: "text", text: message.content },
       ...imageUrls.map((url) => ({
         type: "image_url" as const,
-        imageUrl: { url }
+        image_url: { url }
       })),
       ...files.map((file) => ({
         type: "file" as const,
