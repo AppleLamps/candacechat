@@ -1,6 +1,8 @@
 "use client";
 
-import { FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, KeyboardEvent, useEffect, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { DEFAULT_MODEL, DEFAULT_SYSTEM_PROMPT, SUGGESTED_PROMPTS } from "@/lib/defaults";
 
 type Role = "user" | "assistant";
@@ -10,7 +12,34 @@ type Message = {
   role: Role;
   content: string;
   createdAt: string;
+  imageAttachments?: ImageAttachment[];
+  pdfAttachments?: PdfAttachment[];
+  annotations?: unknown[];
   error?: boolean;
+};
+
+type ImageAttachment = {
+  id: string;
+  name: string;
+  mimeType: string;
+  url: string;
+};
+
+type PdfAttachment = {
+  id: string;
+  name: string;
+  url: string;
+};
+
+type Conversation = {
+  id: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  messages: Message[];
+  systemPrompt: string;
+  model: string;
+  manualTitle?: boolean;
 };
 
 type ApiError = {
@@ -18,7 +47,62 @@ type ApiError = {
   status?: number;
 };
 
+type RequestMode = "standard" | "extended";
+
+type SpeechRecognitionResultEventLike = Event & {
+  results: {
+    length: number;
+    [index: number]: {
+      length: number;
+      isFinal: boolean;
+      [index: number]: { transcript: string };
+    };
+  };
+};
+
+type SpeechRecognitionErrorEventLike = Event & {
+  error?: string;
+};
+
+type SpeechRecognitionLike = {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onend: (() => void) | null;
+  onerror: ((event: SpeechRecognitionErrorEventLike) => void) | null;
+  onresult: ((event: SpeechRecognitionResultEventLike) => void) | null;
+  abort: () => void;
+  start: () => void;
+  stop: () => void;
+};
+
+type SpeechRecognitionWindow = Window & {
+  SpeechRecognition?: new () => SpeechRecognitionLike;
+  webkitSpeechRecognition?: new () => SpeechRecognitionLike;
+};
+
 const exampleTitle = "Candace Voice Chat";
+const STORAGE_KEY = "candace-chat-conversations-v1";
+const CLIENT_MAX_MESSAGES = 512;
+const CLIENT_MAX_MESSAGE_CHARS = 1_000_000;
+const CLIENT_MAX_SYSTEM_PROMPT_CHARS = 300_000;
+const CLIENT_MAX_REQUEST_CHARS = 3_600_000;
+const MAX_TEXT_ATTACHMENT_CHARS = 500_000;
+const SUPPORTED_IMAGE_TYPES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+  "image/gif"
+]);
+const TEXT_ATTACHMENT_TYPES = new Set([
+  "application/json",
+  "application/xml",
+  "text/csv",
+  "text/html",
+  "text/markdown",
+  "text/plain",
+  "text/tab-separated-values"
+]);
 
 function uid() {
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -35,23 +119,239 @@ function roleLabel(role: Role) {
   return role === "user" ? "You" : "Assistant";
 }
 
+function titleFromMessages(messages: Message[]) {
+  const firstUserMessage = messages.find((message) => message.role === "user");
+  const text = firstUserMessage?.content.trim().replace(/\s+/g, " ") || "New chat";
+  return text.length > 52 ? `${text.slice(0, 49)}…` : text;
+}
+
+function sortConversations(conversations: Conversation[]) {
+  return [...conversations].sort(
+    (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
+  );
+}
+
+function trimMessagesForRequest(messages: Message[], systemPrompt: string) {
+  if (systemPrompt.length > CLIENT_MAX_SYSTEM_PROMPT_CHARS) {
+    throw new Error(
+      `System prompt is too large. Keep it under ${CLIENT_MAX_SYSTEM_PROMPT_CHARS.toLocaleString()} characters.`
+    );
+  }
+
+  const budget = CLIENT_MAX_REQUEST_CHARS - systemPrompt.length;
+  const selected: Message[] = [];
+  let usedCharacters = 0;
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    const messageSize =
+      message.content.length +
+      (message.imageAttachments || []).reduce(
+        (total, image) => total + image.url.length,
+        0
+      ) +
+      (message.pdfAttachments || []).reduce(
+        (total, pdf) => total + pdf.url.length,
+        0
+      );
+
+    if (messageSize > CLIENT_MAX_MESSAGE_CHARS) {
+      throw new Error(
+        `One message plus its attachments is too large. Keep each message under ${CLIENT_MAX_MESSAGE_CHARS.toLocaleString()} characters.`
+      );
+    }
+
+    if (
+      selected.length >= CLIENT_MAX_MESSAGES ||
+      usedCharacters + messageSize > budget
+    ) {
+      break;
+    }
+
+    selected.unshift(message);
+    usedCharacters += messageSize;
+  }
+
+  if (selected.length === 0 && messages.length > 0) {
+    throw new Error("The newest message is too large to send.");
+  }
+
+  return {
+    messages: selected,
+    omittedCount: messages.length - selected.length,
+    sentCharacters: usedCharacters
+  };
+}
+
+function conversationTranscript(conversationTitle: string, messages: Message[]) {
+  const transcript = messages
+    .map((message) => {
+      const label = roleLabel(message.role);
+      const attachments = [
+        ...(message.imageAttachments || []).map(
+          (image) => `[Attached image: ${image.name}]`
+        ),
+        ...(message.pdfAttachments || []).map(
+          (pdf) => `[Attached PDF: ${pdf.name}]`
+        )
+      ];
+      const attachmentText = attachments.length
+        ? `\n\n${attachments.join("\n")}`
+        : "";
+
+      return `${label} (${timeLabel(message.createdAt)}):\n${message.content}${attachmentText}`;
+    })
+    .join("\n\n---\n\n");
+
+  return `# ${conversationTitle}\n\n${transcript}`;
+}
+
+async function copyText(text: string) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "true");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  document.execCommand("copy");
+  textarea.remove();
+}
+
+function isTextAttachment(file: File) {
+  return file.type.startsWith("text/") || TEXT_ATTACHMENT_TYPES.has(file.type);
+}
+
+function isImageAttachment(file: File) {
+  return SUPPORTED_IMAGE_TYPES.has(file.type);
+}
+
+function isPdfAttachment(file: File) {
+  return file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+}
+
+function readFileAsDataUrl(file: File) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === "string") {
+        resolve(reader.result);
+        return;
+      }
+
+      reject(new Error(`Could not read ${file.name}.`));
+    };
+    reader.onerror = () => reject(new Error(`Could not read ${file.name}.`));
+    reader.readAsDataURL(file);
+  });
+}
+
+function isPdfUrl(url: URL) {
+  return url.pathname.toLowerCase().endsWith(".pdf");
+}
+
+function fileFenceLanguage(fileName: string) {
+  const extension = fileName.split(".").pop()?.toLowerCase();
+
+  if (!extension) return "text";
+
+  if (["csv", "html", "json", "log", "md", "ts", "tsx", "txt", "xml"].includes(extension)) {
+    return extension === "txt" ? "text" : extension;
+  }
+
+  return "text";
+}
+
+function isConversation(value: unknown): value is Conversation {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<Conversation>;
+  return (
+    typeof candidate.id === "string" &&
+    typeof candidate.title === "string" &&
+    typeof candidate.createdAt === "string" &&
+    typeof candidate.updatedAt === "string" &&
+    typeof candidate.systemPrompt === "string" &&
+    typeof candidate.model === "string" &&
+    Array.isArray(candidate.messages)
+  );
+}
+
 export default function ChatApp() {
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [activeConversationId, setActiveConversationId] = useState(uid);
+  const [hasHydrated, setHasHydrated] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
+  const [pendingImages, setPendingImages] = useState<ImageAttachment[]>([]);
+  const [pendingPdfs, setPendingPdfs] = useState<PdfAttachment[]>([]);
   const [systemPrompt, setSystemPrompt] = useState(DEFAULT_SYSTEM_PROMPT);
   const [draftPrompt, setDraftPrompt] = useState(DEFAULT_SYSTEM_PROMPT);
   const [model, setModel] = useState(DEFAULT_MODEL);
   const [draftModel, setDraftModel] = useState(DEFAULT_MODEL);
+  const [requestMode, setRequestMode] = useState<RequestMode>("standard");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [isSending, setIsSending] = useState(false);
+  const [isListening, setIsListening] = useState(false);
+  const [isReadingFiles, setIsReadingFiles] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [composerNote, setComposerNote] = useState<string | null>(null);
+  const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
+  const [shareStatus, setShareStatus] = useState<string | null>(null);
   const [lastUserMessage, setLastUserMessage] = useState<string | null>(null);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
+  const voiceBaseInputRef = useRef("");
 
-  const canSend = input.trim().length > 0 && !isSending;
+  const canSend =
+    (input.trim().length > 0 ||
+      pendingImages.length > 0 ||
+      pendingPdfs.length > 0) &&
+    !isSending &&
+    !isReadingFiles;
   const lastAssistantErrored = messages[messages.length - 1]?.error === true;
+
+  useEffect(() => {
+    try {
+      const stored = window.localStorage.getItem(STORAGE_KEY);
+      const parsed = stored ? (JSON.parse(stored) as unknown) : [];
+      const saved = Array.isArray(parsed)
+        ? sortConversations(parsed.filter(isConversation))
+        : [];
+
+      if (saved.length > 0) {
+        const latest = saved[0];
+        setConversations(saved);
+        setActiveConversationId(latest.id);
+        setMessages(latest.messages);
+        setSystemPrompt(latest.systemPrompt || DEFAULT_SYSTEM_PROMPT);
+        setDraftPrompt(latest.systemPrompt || DEFAULT_SYSTEM_PROMPT);
+        setModel(latest.model || DEFAULT_MODEL);
+        setDraftModel(latest.model || DEFAULT_MODEL);
+        setLastUserMessage(
+          [...latest.messages].reverse().find((message) => message.role === "user")
+            ?.content || null
+        );
+      }
+    } catch {
+      // Corrupt local storage should never block the chat UI.
+      window.localStorage.removeItem(STORAGE_KEY);
+    } finally {
+      setHasHydrated(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!hasHydrated) return;
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(conversations));
+  }, [conversations, hasHydrated]);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({
@@ -67,54 +367,218 @@ export default function ChatApp() {
     }
   }, [settingsOpen, systemPrompt, model]);
 
-  const requestMessages = useMemo(
-    () =>
-      messages
-        .filter((message) => !message.error)
-        .map((message) => ({
-          role: message.role,
-          content: message.content
-        })),
-    [messages]
-  );
+  useEffect(() => {
+    return () => {
+      recognitionRef.current?.abort();
+    };
+  }, []);
 
-  async function sendMessage(content: string, retry = false) {
+  function persistActiveConversation(nextMessages: Message[]) {
+    if (nextMessages.length === 0) return;
+
+    const now = new Date().toISOString();
+    setConversations((current) => {
+      const existing = current.find(
+        (conversation) => conversation.id === activeConversationId
+      );
+      const title =
+        existing?.manualTitle && existing.title
+          ? existing.title
+          : titleFromMessages(nextMessages);
+      const nextConversation: Conversation = {
+        id: activeConversationId,
+        title,
+        createdAt: existing?.createdAt || now,
+        updatedAt: now,
+        messages: nextMessages,
+        systemPrompt,
+        model,
+        manualTitle: existing?.manualTitle
+      };
+
+      return sortConversations([
+        nextConversation,
+        ...current.filter(
+          (conversation) => conversation.id !== activeConversationId
+        )
+      ]);
+    });
+  }
+
+  function openConversation(conversation: Conversation) {
+    setActiveConversationId(conversation.id);
+    setMessages(conversation.messages);
+    setSystemPrompt(conversation.systemPrompt || DEFAULT_SYSTEM_PROMPT);
+    setDraftPrompt(conversation.systemPrompt || DEFAULT_SYSTEM_PROMPT);
+    setModel(conversation.model || DEFAULT_MODEL);
+    setDraftModel(conversation.model || DEFAULT_MODEL);
+    setInput("");
+    setPendingImages([]);
+    setPendingPdfs([]);
+    setError(null);
+    setLastUserMessage(
+      [...conversation.messages].reverse().find((message) => message.role === "user")
+        ?.content || null
+    );
+  }
+
+  function startNewChat() {
+    const id = uid();
+    const now = new Date().toISOString();
+    const conversation: Conversation = {
+      id,
+      title: "New chat",
+      createdAt: now,
+      updatedAt: now,
+      messages: [],
+      systemPrompt,
+      model
+    };
+
+    setConversations((current) => sortConversations([conversation, ...current]));
+    setActiveConversationId(id);
+    setMessages([]);
+    setInput("");
+    setPendingImages([]);
+    setPendingPdfs([]);
+    setError(null);
+    setLastUserMessage(null);
+    inputRef.current?.focus();
+  }
+
+  function deleteConversation(id: string) {
+    const remaining = sortConversations(
+      conversations.filter((conversation) => conversation.id !== id)
+    );
+    setConversations(remaining);
+
+    if (id !== activeConversationId) return;
+
+    const next = remaining[0];
+    if (next) {
+      openConversation(next);
+      return;
+    }
+
+    startNewChat();
+  }
+
+  function renameConversation(id: string) {
+    const conversation = conversations.find((item) => item.id === id);
+    if (!conversation) return;
+
+    const nextTitle = window.prompt("Rename chat", conversation.title)?.trim();
+    if (!nextTitle) return;
+
+    setConversations((current) =>
+      sortConversations(
+        current.map((item) =>
+          item.id === id
+            ? {
+                ...item,
+                title: nextTitle,
+                manualTitle: true,
+                updatedAt: new Date().toISOString()
+              }
+            : item
+        )
+      )
+    );
+  }
+
+  async function sendMessage(
+    content: string,
+    retry = false,
+    baseMessages = messages
+  ) {
     const trimmed = content.trim();
-    if (!trimmed || isSending) return;
+    const imagesForMessage = retry ? [] : pendingImages;
+    const pdfsForMessage = retry ? [] : pendingPdfs;
+    const messageContent =
+      trimmed ||
+      (pdfsForMessage.length > 0
+        ? "What are the main points in this document?"
+        : "What's in this image?");
+
+    if (
+      (!trimmed && imagesForMessage.length === 0 && pdfsForMessage.length === 0) ||
+      isSending
+    ) {
+      return;
+    }
 
     setError(null);
+    setComposerNote(null);
     setIsSending(true);
-    setLastUserMessage(trimmed);
+    setLastUserMessage(messageContent);
 
     const userMessage: Message = {
       id: uid(),
       role: "user",
-      content: trimmed,
-      createdAt: new Date().toISOString()
+      content: messageContent,
+      createdAt: new Date().toISOString(),
+      imageAttachments:
+        imagesForMessage.length > 0 ? imagesForMessage : undefined,
+      pdfAttachments: pdfsForMessage.length > 0 ? pdfsForMessage : undefined
     };
 
-    const nextMessages = retry ? requestMessages : [...requestMessages, userMessage];
+    const cleanMessages = baseMessages.filter((message) => !message.error);
+    const optimisticMessages = retry ? cleanMessages : [...cleanMessages, userMessage];
+
+    setMessages(optimisticMessages);
+    persistActiveConversation(optimisticMessages);
 
     if (!retry) {
-      setMessages((current) => [...current, userMessage]);
       setInput("");
-    } else {
-      setMessages((current) => current.filter((message) => !message.error));
+      setPendingImages([]);
+      setPendingPdfs([]);
     }
 
     try {
+      const trimmedRequest = trimMessagesForRequest(
+        optimisticMessages,
+        systemPrompt
+      );
+      const apiMessages = trimmedRequest.messages.map((message) => ({
+        role: message.role,
+        content: message.content,
+        imageUrls:
+          message.role === "user"
+            ? message.imageAttachments?.map((image) => image.url)
+            : undefined,
+        files:
+          message.role === "user"
+            ? message.pdfAttachments?.map((pdf) => ({
+                filename: pdf.name,
+                fileData: pdf.url
+              }))
+            : undefined,
+        annotations: message.annotations
+      }));
+
+      if (trimmedRequest.omittedCount > 0) {
+        setComposerNote(
+          `Sent the latest ${trimmedRequest.messages.length} messages (${trimmedRequest.sentCharacters.toLocaleString()} characters); ${trimmedRequest.omittedCount} older messages were outside the large-context budget.`
+        );
+      }
+
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           model,
+          responseMode: requestMode,
           systemPrompt,
-          messages: nextMessages
+          messages: apiMessages
         })
       });
 
       const data = (await response.json().catch(() => ({}))) as
-        | { reply?: string }
+        | {
+            reply?: string;
+            annotations?: unknown[];
+            cache?: { status?: string | null; ttl?: string | null };
+          }
         | ApiError;
 
       if (!response.ok || "error" in data) {
@@ -125,29 +589,35 @@ export default function ChatApp() {
         throw new Error(message);
       }
 
-      setMessages((current) => [
-        ...current,
-        {
-          id: uid(),
-          role: "assistant",
-          content: data.reply || "No response returned.",
-          createdAt: new Date().toISOString()
-        }
-      ]);
+      const assistantMessage: Message = {
+        id: uid(),
+        role: "assistant",
+        content: data.reply || "No response returned.",
+        createdAt: new Date().toISOString(),
+        annotations: "annotations" in data ? data.annotations : undefined
+      };
+      const finalMessages = [...optimisticMessages, assistantMessage];
+      setMessages(finalMessages);
+      persistActiveConversation(finalMessages);
+      if ("cache" in data && data.cache?.status) {
+        setComposerNote(
+          `OpenRouter cache ${data.cache.status}${data.cache.ttl ? ` · TTL ${data.cache.ttl}s` : ""}.`
+        );
+      }
     } catch (caught) {
       const message =
         caught instanceof Error ? caught.message : "Something went wrong.";
+      const errorMessage: Message = {
+        id: uid(),
+        role: "assistant",
+        content: message,
+        createdAt: new Date().toISOString(),
+        error: true
+      };
+      const finalMessages = [...optimisticMessages, errorMessage];
       setError(message);
-      setMessages((current) => [
-        ...current,
-        {
-          id: uid(),
-          role: "assistant",
-          content: message,
-          createdAt: new Date().toISOString(),
-          error: true
-        }
-      ]);
+      setMessages(finalMessages);
+      persistActiveConversation(finalMessages);
     } finally {
       setIsSending(false);
       inputRef.current?.focus();
@@ -177,64 +647,387 @@ export default function ChatApp() {
     void sendMessage(lastUserMessage, true);
   }
 
+  async function copyMessage(message: Message) {
+    try {
+      await copyText(message.content);
+      setCopiedMessageId(message.id);
+      window.setTimeout(() => setCopiedMessageId(null), 1500);
+    } catch {
+      setError("Could not copy that message.");
+    }
+  }
+
+  function retryAssistantMessage(messageId: string) {
+    const messageIndex = messages.findIndex((message) => message.id === messageId);
+    if (messageIndex <= 0) return;
+
+    const previousMessages = messages.slice(0, messageIndex);
+    const previousUserMessage = [...previousMessages]
+      .reverse()
+      .find((message) => message.role === "user");
+
+    if (!previousUserMessage) {
+      setError("No user message found to retry.");
+      return;
+    }
+
+    const nextMessages = previousMessages.filter((message) => !message.error);
+    setMessages(nextMessages);
+    persistActiveConversation(nextMessages);
+    void sendMessage(previousUserMessage.content, true, nextMessages);
+  }
+
+  async function shareConversation() {
+    if (messages.length === 0) {
+      setComposerNote("Start a chat before sharing.");
+      return;
+    }
+
+    const activeConversation = conversations.find(
+      (conversation) => conversation.id === activeConversationId
+    );
+    const title = activeConversation?.title || titleFromMessages(messages);
+    const text = conversationTranscript(title, messages);
+
+    try {
+      if (navigator.share) {
+        await navigator.share({ title, text });
+        setShareStatus("Shared");
+      } else {
+        await copyText(text);
+        setShareStatus("Copied");
+        setComposerNote("Conversation transcript copied to clipboard.");
+      }
+
+      window.setTimeout(() => setShareStatus(null), 1500);
+    } catch (caught) {
+      if (caught instanceof DOMException && caught.name === "AbortError") return;
+      setError("Could not share this conversation.");
+    }
+  }
+
+  async function addAttachments(files: FileList | null) {
+    if (!files?.length) return;
+
+    setIsReadingFiles(true);
+    setError(null);
+
+    try {
+      const textBlocks: string[] = [];
+      const imageBlocks: ImageAttachment[] = [];
+      const pdfBlocks: PdfAttachment[] = [];
+
+      for (const file of Array.from(files)) {
+        if (isImageAttachment(file)) {
+          imageBlocks.push({
+            id: uid(),
+            name: file.name,
+            mimeType: file.type,
+            url: await readFileAsDataUrl(file)
+          });
+          continue;
+        }
+
+        if (isPdfAttachment(file)) {
+          pdfBlocks.push({
+            id: uid(),
+            name: file.name,
+            url: await readFileAsDataUrl(file)
+          });
+          continue;
+        }
+
+        if (isTextAttachment(file)) {
+          const text = await file.text();
+          const clipped =
+            text.length > MAX_TEXT_ATTACHMENT_CHARS
+              ? `${text.slice(0, MAX_TEXT_ATTACHMENT_CHARS)}\n\n[Truncated after ${MAX_TEXT_ATTACHMENT_CHARS.toLocaleString()} characters.]`
+              : text;
+
+          textBlocks.push(
+            `Attached file: ${file.name}\n\n\`\`\`${fileFenceLanguage(file.name)}\n${clipped}\n\`\`\``
+          );
+          continue;
+        }
+
+        throw new Error(
+          `${file.name} is not supported. Attach text files, PDFs, or PNG, JPEG, WebP, and GIF images.`
+        );
+      }
+
+      if (textBlocks.length > 0) {
+        setInput((current) =>
+          [current.trim(), ...textBlocks].filter(Boolean).join("\n\n")
+        );
+      }
+
+      if (imageBlocks.length > 0) {
+        setPendingImages((current) => [...current, ...imageBlocks]);
+      }
+
+      if (pdfBlocks.length > 0) {
+        setPendingPdfs((current) => [...current, ...pdfBlocks]);
+      }
+
+      const notes = [
+        textBlocks.length > 0
+          ? `${textBlocks.length.toLocaleString()} text attachment${textBlocks.length === 1 ? "" : "s"} added`
+          : "",
+        imageBlocks.length > 0
+          ? `${imageBlocks.length.toLocaleString()} image attachment${imageBlocks.length === 1 ? "" : "s"} added`
+          : "",
+        pdfBlocks.length > 0
+          ? `${pdfBlocks.length.toLocaleString()} PDF attachment${pdfBlocks.length === 1 ? "" : "s"} added`
+          : ""
+      ].filter(Boolean);
+
+      if (notes.length > 0) {
+        setComposerNote(`${notes.join(" and ")} to the prompt.`);
+      }
+
+      inputRef.current?.focus();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not read that file.");
+    } finally {
+      setIsReadingFiles(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  }
+
+  function removePendingImage(id: string) {
+    setPendingImages((current) => {
+      const next = current.filter((image) => image.id !== id);
+
+      if (next.length === 0 && pendingPdfs.length === 0) {
+        setComposerNote(null);
+      }
+
+      return next;
+    });
+  }
+
+  function removePendingPdf(id: string) {
+    setPendingPdfs((current) => {
+      const next = current.filter((pdf) => pdf.id !== id);
+
+      if (next.length === 0 && pendingImages.length === 0) {
+        setComposerNote(null);
+      }
+
+      return next;
+    });
+  }
+
+  function addHostedImageUrl() {
+    const url = window.prompt("Paste a public image or PDF URL")?.trim();
+
+    if (!url) return;
+
+    try {
+      const parsed = new URL(url);
+
+      if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+        throw new Error("Use a public http or https image/PDF URL.");
+      }
+
+      if (isPdfUrl(parsed)) {
+        setPendingPdfs((current) => [
+          ...current,
+          {
+            id: uid(),
+            name: parsed.pathname.split("/").pop() || "Hosted PDF",
+            url
+          }
+        ]);
+        setComposerNote("Hosted PDF URL added to the next message.");
+      } else {
+        setPendingImages((current) => [
+          ...current,
+          {
+            id: uid(),
+            name: parsed.pathname.split("/").pop() || "Hosted image",
+            mimeType: "image/url",
+            url
+          }
+        ]);
+        setComposerNote("Hosted image URL added to the next message.");
+      }
+      inputRef.current?.focus();
+    } catch (caught) {
+      setError(
+        caught instanceof Error ? caught.message : "That image/PDF URL is not valid."
+      );
+    }
+  }
+
+  function toggleVoiceInput() {
+    if (isListening) {
+      recognitionRef.current?.stop();
+      setIsListening(false);
+      return;
+    }
+
+    const SpeechRecognitionConstructor =
+      (window as SpeechRecognitionWindow).SpeechRecognition ||
+      (window as SpeechRecognitionWindow).webkitSpeechRecognition;
+
+    if (!SpeechRecognitionConstructor) {
+      setComposerNote("Voice input is not supported in this browser.");
+      return;
+    }
+
+    const recognition = new SpeechRecognitionConstructor();
+    voiceBaseInputRef.current = input;
+    recognition.continuous = false;
+    recognition.interimResults = true;
+    recognition.lang = "en-US";
+    recognition.onresult = (event) => {
+      let transcript = "";
+
+      for (let index = 0; index < event.results.length; index += 1) {
+        transcript += event.results[index][0]?.transcript || "";
+      }
+
+      if (transcript.trim()) {
+        setInput(
+          [voiceBaseInputRef.current.trim(), transcript.trim()]
+            .filter(Boolean)
+            .join(" ")
+        );
+      }
+    };
+    recognition.onerror = (event) => {
+      setComposerNote(`Voice input stopped${event.error ? `: ${event.error}` : "."}`);
+    };
+    recognition.onend = () => {
+      setIsListening(false);
+      recognitionRef.current = null;
+    };
+
+    recognitionRef.current = recognition;
+    setComposerNote("Listening...");
+    setIsListening(true);
+    recognition.start();
+  }
+
   function saveSettings() {
-    setSystemPrompt(draftPrompt.trim() || DEFAULT_SYSTEM_PROMPT);
-    setModel(draftModel.trim() || DEFAULT_MODEL);
+    const nextPrompt = draftPrompt.trim() || DEFAULT_SYSTEM_PROMPT;
+    const nextModel = draftModel.trim() || DEFAULT_MODEL;
+    setSystemPrompt(nextPrompt);
+    setModel(nextModel);
+
+    setConversations((current) => {
+      const now = new Date().toISOString();
+      const existing = current.find(
+        (conversation) => conversation.id === activeConversationId
+      );
+      const nextConversation: Conversation = {
+        id: activeConversationId,
+        title: existing?.title || titleFromMessages(messages),
+        createdAt: existing?.createdAt || now,
+        updatedAt: now,
+        messages,
+        systemPrompt: nextPrompt,
+        model: nextModel,
+        manualTitle: existing?.manualTitle
+      };
+
+      return sortConversations([
+        nextConversation,
+        ...current.filter(
+          (conversation) => conversation.id !== activeConversationId
+        )
+      ]);
+    });
+
     setSettingsOpen(false);
   }
 
   function resetChat() {
-    setMessages([]);
-    setInput("");
-    setError(null);
-    setLastUserMessage(null);
-    inputRef.current?.focus();
+    startNewChat();
   }
 
   return (
-    <main className="min-h-screen px-3 py-3 text-ink sm:px-4 lg:px-6">
-      <div className="mx-auto flex min-h-[calc(100vh-1.5rem)] max-w-7xl overflow-hidden rounded-[2rem] border border-white/75 bg-white/70 shadow-soft backdrop-blur-xl">
-        <aside className="hidden w-[320px] shrink-0 border-r border-line/80 bg-[#f8f4ec]/85 p-5 lg:flex lg:flex-col">
+    <main className="flex h-screen overflow-hidden bg-white text-[#0d0d0d]">
+      <aside className="hidden w-[260px] shrink-0 flex-col border-r border-[#e8e8e8] bg-[#f9f9f9] md:flex">
+        <div className="flex h-full flex-col p-3">
           <BrandBlock />
-          <div className="mt-8 space-y-3">
+          <div className="mt-4 space-y-1">
             <SidebarButton
-              label="New conversation"
-              icon="+"
+              label="New chat"
+              icon="✎"
               onClick={resetChat}
             />
             <SidebarButton
-              label="Assistant settings"
-              icon="⌘"
+              label="Settings"
+              icon="⚙"
               onClick={() => setSettingsOpen(true)}
             />
           </div>
-          <div className="mt-8 rounded-3xl border border-line bg-white/70 p-4 shadow-sm">
-            <p className="text-xs font-bold uppercase tracking-[0.18em] text-ink/45">
-              Active model
-            </p>
-            <p className="mt-2 break-all font-mono text-sm text-ink">{model}</p>
+          <div className="mt-6 px-2 text-xs font-semibold text-[#6b6b6b]">
+            Recents
           </div>
-          <div className="mt-auto rounded-3xl border border-line bg-white/55 p-4">
-            <p className="font-display text-2xl leading-tight">
-              Prompt control, without clutter.
-            </p>
-            <p className="mt-3 text-sm leading-6 text-ink/62">
-              Edit the system prompt in settings. Every request sends the full
-              chat history with your current behavior prompt first.
-            </p>
+          <div className="mt-2 min-h-0 flex-1 overflow-y-auto pr-1">
+            {conversations.length === 0 ? (
+              <p className="px-3 py-2 text-sm text-[#8a8a8a]">No chats yet</p>
+            ) : (
+              <div className="space-y-1">
+                {conversations.map((conversation) => (
+                  <div
+                    key={conversation.id}
+                    className={`group flex items-center gap-1 rounded-lg ${
+                      conversation.id === activeConversationId
+                        ? "bg-[#ececec]"
+                        : "hover:bg-[#ececec]"
+                    }`}
+                  >
+                    <button
+                      onClick={() => openConversation(conversation)}
+                      className="min-w-0 flex-1 truncate px-3 py-2 text-left text-sm text-[#404040] focus:outline-none focus:ring-2 focus:ring-[#d9d9d9]"
+                      title={conversation.title}
+                    >
+                      {conversation.title}
+                    </button>
+                    <button
+                      onClick={() => renameConversation(conversation.id)}
+                      className="hidden h-7 w-7 shrink-0 items-center justify-center rounded-md text-[#777] transition hover:bg-[#dedede] hover:text-[#111] group-hover:flex"
+                      aria-label={`Rename ${conversation.title}`}
+                      title="Rename"
+                    >
+                      ✎
+                    </button>
+                    <button
+                      onClick={() => deleteConversation(conversation.id)}
+                      className="mr-1 hidden h-7 w-7 shrink-0 items-center justify-center rounded-md text-[#777] transition hover:bg-[#dedede] hover:text-[#111] group-hover:flex"
+                      aria-label={`Delete ${conversation.title}`}
+                      title="Delete"
+                    >
+                      ×
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
-        </aside>
+          <div className="mt-auto rounded-xl px-3 py-2 text-xs text-[#777]">
+            Apple Lamps
+          </div>
+        </div>
+      </aside>
 
-        <section className="flex min-w-0 flex-1 flex-col">
+      <section className="relative flex min-w-0 flex-1 flex-col bg-white">
           <Header
             model={model}
             onOpenSettings={() => setSettingsOpen(true)}
             onReset={resetChat}
+            onShare={shareConversation}
+            canShare={messages.length > 0}
+            shareStatus={shareStatus}
           />
 
           <div
             ref={scrollRef}
-            className="scrollbar-soft flex-1 overflow-y-auto px-4 py-6 sm:px-6 lg:px-10"
+          className="scrollbar-soft flex-1 overflow-y-auto px-4 pb-44 pt-8 sm:px-6"
           >
             {messages.length === 0 ? (
               <EmptyState
@@ -244,16 +1037,23 @@ export default function ChatApp() {
                 }}
               />
             ) : (
-              <div className="mx-auto flex max-w-4xl flex-col gap-5">
+            <div className="mx-auto flex max-w-3xl flex-col gap-7">
                 {messages.map((message) => (
-                  <MessageBubble key={message.id} message={message} />
+                  <MessageBubble
+                    key={message.id}
+                    message={message}
+                    copied={copiedMessageId === message.id}
+                    onCopy={() => void copyMessage(message)}
+                    onRetry={() => retryAssistantMessage(message.id)}
+                  />
                 ))}
                 {isSending ? <LoadingBubble /> : null}
               </div>
             )}
           </div>
 
-          <div className="border-t border-line/80 bg-white/65 px-4 py-4 backdrop-blur sm:px-6 lg:px-10">
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-white via-white to-white/0 px-4 pb-4 pt-12 sm:px-6">
+          <div className="pointer-events-auto">
             {error && (
               <ErrorBanner
                 message={error}
@@ -263,16 +1063,40 @@ export default function ChatApp() {
             )}
             <Composer
               value={input}
+              images={pendingImages}
+              pdfs={pendingPdfs}
               onChange={setInput}
               onSubmit={handleSubmit}
               onKeyDown={handleKeyDown}
               canSend={canSend}
               isSending={isSending}
+              isReadingFiles={isReadingFiles}
+              isListening={isListening}
+              requestMode={requestMode}
+              note={composerNote}
+              onAttachClick={() => fileInputRef.current?.click()}
+              onHostedImageClick={addHostedImageUrl}
+              onRemoveImage={removePendingImage}
+              onRemovePdf={removePendingPdf}
+              onToggleVoice={toggleVoiceInput}
+              onToggleRequestMode={() =>
+                setRequestMode((current) =>
+                  current === "extended" ? "standard" : "extended"
+                )
+              }
               inputRef={inputRef}
             />
+            <input
+              ref={fileInputRef}
+              type="file"
+              className="hidden"
+              multiple
+              accept=".csv,.gif,.html,.jpeg,.jpg,.json,.log,.md,.pdf,.png,.ts,.tsx,.txt,.webp,.xml,text/*,application/json,application/pdf,application/xml,image/gif,image/jpeg,image/png,image/webp"
+              onChange={(event) => void addAttachments(event.target.files)}
+            />
           </div>
-        </section>
-      </div>
+        </div>
+      </section>
 
       <SettingsPanel
         open={settingsOpen}
@@ -294,23 +1118,13 @@ export default function ChatApp() {
 function BrandBlock() {
   return (
     <div>
-      <div className="flex items-center gap-3">
-        <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-ink text-lg font-black text-white shadow-float">
-          C
-        </div>
+      <div className="flex items-center gap-2 px-2 py-1">
         <div>
-          <h1 className="font-display text-2xl font-semibold tracking-tight">
+          <h1 className="text-[15px] font-semibold tracking-tight">
             {exampleTitle}
           </h1>
-          <p className="text-xs font-bold uppercase tracking-[0.18em] text-brand">
-            OpenRouter powered
-          </p>
         </div>
       </div>
-      <p className="mt-4 text-sm leading-6 text-ink/60">
-        A refined chat interface with editable behavior and secure server-side
-        OpenRouter calls.
-      </p>
     </div>
   );
 }
@@ -327,12 +1141,12 @@ function SidebarButton({
   return (
     <button
       onClick={onClick}
-      className="group flex w-full items-center justify-between rounded-2xl border border-line bg-white/72 px-4 py-3 text-left text-sm font-bold text-ink shadow-sm transition hover:-translate-y-0.5 hover:border-brand/30 hover:bg-white focus:outline-none focus:ring-4 focus:ring-brand/15"
+      className="group flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm text-[#303030] transition hover:bg-[#ececec] focus:outline-none focus:ring-2 focus:ring-[#d9d9d9]"
     >
-      <span className="font-semibold">{label}</span>
-      <span className="flex h-7 w-7 items-center justify-center rounded-full bg-warm text-xs text-ink/70 transition group-hover:bg-brand group-hover:text-white">
+      <span className="flex h-5 w-5 items-center justify-center text-sm text-[#555]">
         {icon}
       </span>
+      <span>{label}</span>
     </button>
   );
 }
@@ -340,38 +1154,55 @@ function SidebarButton({
 function Header({
   model,
   onOpenSettings,
-  onReset
+  onReset,
+  onShare,
+  canShare,
+  shareStatus
 }: {
   model: string;
   onOpenSettings: () => void;
   onReset: () => void;
+  onShare: () => void;
+  canShare: boolean;
+  shareStatus: string | null;
 }) {
   return (
-    <header className="flex items-center justify-between gap-3 border-b border-line/80 bg-white/72 px-4 py-4 backdrop-blur sm:px-6 lg:px-8">
-      <div className="min-w-0">
-        <div className="flex items-center gap-2">
-          <span className="h-2.5 w-2.5 rounded-full bg-emerald-500 shadow-[0_0_0_4px_rgba(16,185,129,0.14)]" />
-          <p className="truncate text-xs font-bold uppercase tracking-[0.2em] text-ink/45">
-            Ready
+    <header className="flex h-14 items-center justify-between gap-3 bg-white px-3 sm:px-5">
+      <div className="flex min-w-0 items-center gap-2">
+        <button
+          onClick={onReset}
+          className="rounded-lg px-3 py-2 text-sm font-medium text-[#444] transition hover:bg-[#f2f2f2] focus:outline-none focus:ring-2 focus:ring-[#d9d9d9] md:hidden"
+        >
+          New chat
+        </button>
+        <div className="hidden min-w-0 items-center gap-2 md:flex">
+          <p className="truncate text-sm font-semibold text-[#333]">
+            Candace
           </p>
+          <span className="text-[#c7c7c7]">•</span>
+          <p className="truncate font-mono text-xs text-[#777]">{model}</p>
         </div>
-        <h2 className="mt-1 truncate font-display text-2xl font-semibold tracking-tight sm:text-3xl">
-          Candace-style assistant
-        </h2>
-        <p className="mt-1 truncate font-mono text-xs text-ink/45">{model}</p>
       </div>
       <div className="flex shrink-0 items-center gap-2">
         <button
           onClick={onReset}
-          className="hidden rounded-full border border-line bg-white px-4 py-2 text-sm font-semibold text-ink/70 transition hover:-translate-y-0.5 hover:text-ink focus:outline-none focus:ring-4 focus:ring-brand/15 sm:inline-flex"
+          className="hidden rounded-lg px-3 py-2 text-sm font-medium text-[#444] transition hover:bg-[#f2f2f2] focus:outline-none focus:ring-2 focus:ring-[#d9d9d9] sm:inline-flex"
         >
           New chat
         </button>
         <button
-          onClick={onOpenSettings}
-          className="rounded-full bg-ink px-4 py-2 text-sm font-bold text-white shadow-float transition hover:-translate-y-0.5 hover:bg-brand-ink focus:outline-none focus:ring-4 focus:ring-brand/20"
+          onClick={onShare}
+          disabled={!canShare}
+          className="hidden rounded-lg px-3 py-2 text-sm font-medium text-[#444] transition hover:bg-[#f2f2f2] focus:outline-none focus:ring-2 focus:ring-[#d9d9d9] disabled:cursor-not-allowed disabled:text-[#b6b6b6] disabled:hover:bg-transparent sm:inline-flex"
+          title={shareStatus || "Share conversation"}
         >
-          Settings
+          {shareStatus || "Share"}
+        </button>
+        <button
+          onClick={onOpenSettings}
+          className="rounded-lg px-3 py-2 text-sm font-medium text-[#444] transition hover:bg-[#f2f2f2] focus:outline-none focus:ring-2 focus:ring-[#d9d9d9]"
+        >
+          •••
         </button>
       </div>
     </header>
@@ -380,99 +1211,154 @@ function Header({
 
 function EmptyState({ onPick }: { onPick: (prompt: string) => void }) {
   return (
-    <div className="mx-auto flex min-h-full max-w-5xl items-center">
-      <div className="grid gap-8 lg:grid-cols-[1.05fr_0.95fr] lg:items-end">
-        <div>
-          <p className="text-xs font-extrabold uppercase tracking-[0.24em] text-brand">
-            Start a conversation
-          </p>
-          <h2 className="mt-4 max-w-2xl font-display text-5xl font-semibold leading-[0.96] tracking-tight sm:text-6xl">
-            A polished chat surface for sharp, configurable voice.
-          </h2>
-          <p className="mt-5 max-w-xl text-base leading-7 text-ink/64">
-            Your system prompt lives in settings, the model defaults to Gemini
-            Flash Latest through OpenRouter, and every turn keeps the session
-            context intact.
-          </p>
-        </div>
-        <div className="rounded-[2rem] border border-line bg-white/78 p-4 shadow-soft">
-          <p className="px-2 pb-3 text-sm font-bold text-ink/60">
-            Try one of these
-          </p>
-          <div className="grid gap-2">
-            {SUGGESTED_PROMPTS.map((prompt) => (
-              <button
-                key={prompt}
-                onClick={() => onPick(prompt)}
-                className="rounded-2xl border border-line bg-[#fbfaf7] p-4 text-left text-sm leading-6 text-ink/78 transition hover:-translate-y-0.5 hover:border-brand/35 hover:bg-white hover:shadow-sm focus:outline-none focus:ring-4 focus:ring-brand/15"
-              >
-                {prompt}
-              </button>
-            ))}
-          </div>
+    <div className="mx-auto flex min-h-full max-w-4xl items-center justify-center">
+      <div className="w-full py-10 text-center sm:py-16">
+        <h2 className="text-2xl font-medium tracking-tight text-[#202123] sm:text-[28px]">
+          Hi, how can I help?
+        </h2>
+        <div className="mx-auto mt-8 grid max-w-3xl gap-2 sm:grid-cols-2">
+          {SUGGESTED_PROMPTS.map((prompt) => (
+            <button
+              key={prompt}
+              onClick={() => onPick(prompt)}
+              className="rounded-2xl border border-[#e5e5e5] bg-white p-4 text-left text-sm leading-6 text-[#5f6368] transition hover:bg-[#f7f7f8] focus:outline-none focus:ring-2 focus:ring-[#d9d9d9]"
+            >
+              {prompt}
+            </button>
+          ))}
         </div>
       </div>
     </div>
   );
 }
 
-function MessageBubble({ message }: { message: Message }) {
+function MessageBubble({
+  message,
+  copied,
+  onCopy,
+  onRetry
+}: {
+  message: Message;
+  copied: boolean;
+  onCopy: () => void;
+  onRetry: () => void;
+}) {
   const isUser = message.role === "user";
   return (
     <article
-      className={`flex gap-3 ${isUser ? "justify-end" : "justify-start"}`}
+      className={`group flex ${isUser ? "justify-end" : "justify-start"}`}
     >
-      {!isUser && <Avatar label="A" />}
-      <div className={`max-w-[88%] sm:max-w-[76%] ${isUser ? "order-first" : ""}`}>
-        <div
-          className={`rounded-[1.4rem] px-5 py-4 shadow-sm ${
-            isUser
-              ? "rounded-tr-md bg-ink text-white"
-              : message.error
-                ? "rounded-tl-md border border-red-200 bg-red-50 text-red-950"
-                : "rounded-tl-md border border-line bg-white text-ink"
-          }`}
-        >
-          <div className="message-content whitespace-pre-wrap text-sm leading-6 sm:text-[15px]">
-            {message.content}
+      <div className={`${isUser ? "max-w-[78%]" : "w-full max-w-3xl"}`}>
+        <div className={isUser ? "flex justify-end" : "flex justify-start"}>
+          <div
+            className={
+              isUser
+                ? "rounded-[1.35rem] bg-[#0d0d0d] px-4 py-3 text-white"
+                : message.error
+                  ? "rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-red-950"
+                  : "px-1 py-1 text-[#111]"
+            }
+          >
+            <MarkdownMessage content={message.content} isUser={isUser} />
+            {message.imageAttachments?.length ? (
+              <div className="mt-3 grid grid-cols-2 gap-2">
+                {message.imageAttachments.map((image) => (
+                  <img
+                    key={image.id}
+                    src={image.url}
+                    alt={image.name}
+                    className="max-h-48 rounded-xl object-cover"
+                  />
+                ))}
+              </div>
+            ) : null}
+            {message.pdfAttachments?.length ? (
+              <div className="mt-3 flex flex-col gap-2">
+                {message.pdfAttachments.map((pdf) => (
+                  <a
+                    key={pdf.id}
+                    href={pdf.url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="rounded-lg border border-white/20 bg-white/10 px-3 py-2 text-sm underline-offset-4 hover:underline"
+                  >
+                    {pdf.name}
+                  </a>
+                ))}
+              </div>
+            ) : null}
           </div>
         </div>
         <div
-          className={`mt-2 flex items-center gap-2 text-xs text-ink/42 ${
+          className={`mt-2 flex items-center gap-3 px-1 text-xs text-[#8a8a8a] ${
             isUser ? "justify-end" : "justify-start"
           }`}
         >
           <span>{roleLabel(message.role)}</span>
           <span>•</span>
           <time>{timeLabel(message.createdAt)}</time>
+          {!isUser && !message.error ? (
+            <span className="hidden items-center gap-2 opacity-0 transition group-hover:inline-flex group-hover:opacity-100 sm:inline-flex">
+              <button
+                type="button"
+                onClick={onCopy}
+                className="rounded px-1 py-0.5 hover:bg-[#f2f2f2] hover:text-[#444] focus:outline-none focus:ring-2 focus:ring-[#d9d9d9]"
+              >
+                {copied ? "Copied" : "Copy"}
+              </button>
+              <span>·</span>
+              <button
+                type="button"
+                onClick={onRetry}
+                className="rounded px-1 py-0.5 hover:bg-[#f2f2f2] hover:text-[#444] focus:outline-none focus:ring-2 focus:ring-[#d9d9d9]"
+              >
+                Retry
+              </button>
+            </span>
+          ) : null}
         </div>
       </div>
-      {isUser && <Avatar label="Y" />}
     </article>
   );
 }
 
-function Avatar({ label }: { label: string }) {
+function MarkdownMessage({
+  content,
+  isUser
+}: {
+  content: string;
+  isUser: boolean;
+}) {
   return (
-    <div className="mt-1 flex h-9 w-9 shrink-0 items-center justify-center rounded-2xl border border-line bg-white font-bold text-ink shadow-sm">
-      {label}
+    <div
+      className={`message-content text-[15px] leading-7 ${
+        isUser ? "message-content-user" : "message-content-assistant"
+      }`}
+    >
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          a: ({ children, href }) => (
+            <a href={href} target="_blank" rel="noreferrer">
+              {children}
+            </a>
+          )
+        }}
+      >
+        {content}
+      </ReactMarkdown>
     </div>
   );
 }
 
 function LoadingBubble() {
   return (
-    <article className="flex gap-3">
-      <Avatar label="A" />
-      <div className="max-w-[76%] rounded-[1.4rem] rounded-tl-md border border-line bg-white px-5 py-4 shadow-sm">
+    <article className="flex justify-start">
+      <div className="w-full max-w-3xl px-1 py-1">
         <div className="space-y-3">
-          <div className="h-3 w-64 max-w-full animate-pulse rounded-full bg-warm" />
-          <div className="h-3 w-48 max-w-full animate-pulse rounded-full bg-warm" />
-          <div className="flex gap-1 pt-1">
-            <span className="h-2 w-2 animate-bounce rounded-full bg-brand/70 [animation-delay:-0.2s]" />
-            <span className="h-2 w-2 animate-bounce rounded-full bg-brand/70 [animation-delay:-0.1s]" />
-            <span className="h-2 w-2 animate-bounce rounded-full bg-brand/70" />
-          </div>
+          <div className="h-3 w-64 max-w-full animate-pulse rounded-full bg-[#ececec]" />
+          <div className="h-3 w-48 max-w-full animate-pulse rounded-full bg-[#ececec]" />
+          <p className="text-sm text-[#8a8a8a]">Thinking…</p>
         </div>
       </div>
     </article>
@@ -505,24 +1391,48 @@ function ErrorBanner({
 
 function Composer({
   value,
+  images,
+  pdfs,
   onChange,
   onSubmit,
   onKeyDown,
   canSend,
   isSending,
+  isReadingFiles,
+  isListening,
+  requestMode,
+  note,
+  onAttachClick,
+  onHostedImageClick,
+  onRemoveImage,
+  onRemovePdf,
+  onToggleVoice,
+  onToggleRequestMode,
   inputRef
 }: {
   value: string;
+  images: ImageAttachment[];
+  pdfs: PdfAttachment[];
   onChange: (value: string) => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
   onKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void;
   canSend: boolean;
   isSending: boolean;
+  isReadingFiles: boolean;
+  isListening: boolean;
+  requestMode: RequestMode;
+  note: string | null;
+  onAttachClick: () => void;
+  onHostedImageClick: () => void;
+  onRemoveImage: (id: string) => void;
+  onRemovePdf: (id: string) => void;
+  onToggleVoice: () => void;
+  onToggleRequestMode: () => void;
   inputRef: React.RefObject<HTMLTextAreaElement | null>;
 }) {
   return (
-    <form onSubmit={onSubmit} className="mx-auto max-w-4xl">
-      <div className="rounded-[1.7rem] border border-line bg-white p-2 shadow-float transition focus-within:border-brand/35 focus-within:ring-4 focus-within:ring-brand/10">
+    <form onSubmit={onSubmit} className="mx-auto max-w-3xl">
+      <div className="rounded-[1.75rem] border border-[#d9d9d9] bg-white p-2 shadow-[0_8px_30px_rgba(0,0,0,0.10)] transition focus-within:border-[#bdbdbd]">
         <textarea
           ref={inputRef}
           value={value}
@@ -530,22 +1440,111 @@ function Composer({
           onKeyDown={onKeyDown}
           placeholder="Ask anything. Enter sends, Shift+Enter adds a line."
           rows={1}
-          className="max-h-44 min-h-[58px] w-full resize-none bg-transparent px-4 py-3 text-[15px] leading-6 text-ink outline-none placeholder:text-ink/38"
+          className="max-h-44 min-h-[46px] w-full resize-none bg-transparent px-4 py-3 text-[15px] leading-6 text-[#0d0d0d] outline-none placeholder:text-[#9b9b9b]"
           disabled={isSending}
         />
-        <div className="flex items-center justify-between border-t border-line/80 px-2 pt-2">
-          <p className="hidden text-xs text-ink/42 sm:block">
-            Press <kbd className="rounded-md border border-line px-1.5 py-0.5">Enter</kbd> to send · <kbd className="rounded-md border border-line px-1.5 py-0.5">Shift</kbd> + <kbd className="rounded-md border border-line px-1.5 py-0.5">Enter</kbd> for newline
-          </p>
-          <button
-            type="submit"
-            disabled={!canSend}
-            className="ml-auto rounded-full bg-brand px-5 py-2.5 text-sm font-extrabold text-white shadow-sm transition hover:-translate-y-0.5 hover:bg-brand-ink focus:outline-none focus:ring-4 focus:ring-brand/20 disabled:cursor-not-allowed disabled:bg-ink/18 disabled:text-ink/35 disabled:shadow-none disabled:hover:translate-y-0"
-          >
-            {isSending ? "Sending…" : "Send"}
-          </button>
+        <div className="flex items-center justify-between px-2 pb-1">
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={onAttachClick}
+              disabled={isSending || isReadingFiles}
+              className="flex h-8 w-8 items-center justify-center rounded-full text-xl text-[#6f6f6f] transition hover:bg-[#f1f1f1] focus:outline-none focus:ring-2 focus:ring-[#d9d9d9]"
+              aria-label="Add attachment"
+              title="Attach text, image, or PDF file"
+            >
+              {isReadingFiles ? "…" : "+"}
+            </button>
+            <button
+              type="button"
+              onClick={onHostedImageClick}
+              disabled={isSending || isReadingFiles}
+              className="rounded-full px-3 py-1.5 text-xs font-medium text-[#6f6f6f] transition hover:bg-[#f1f1f1] focus:outline-none focus:ring-2 focus:ring-[#d9d9d9] disabled:cursor-not-allowed disabled:text-[#b6b6b6]"
+              title="Attach hosted image or PDF URL"
+            >
+              URL
+            </button>
+            <button
+              type="button"
+              onClick={onToggleRequestMode}
+              aria-pressed={requestMode === "extended"}
+              className={`rounded-full px-3 py-1.5 text-xs font-medium transition focus:outline-none focus:ring-2 focus:ring-[#d9d9d9] ${
+                requestMode === "extended"
+                  ? "bg-[#0d0d0d] text-white hover:bg-[#303030]"
+                  : "text-[#6f6f6f] hover:bg-[#f1f1f1]"
+              }`}
+              title="Toggle longer answers"
+            >
+              Extended
+            </button>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={onToggleVoice}
+              className="hidden h-8 w-8 items-center justify-center rounded-full text-[#6f6f6f] transition hover:bg-[#f1f1f1] focus:outline-none focus:ring-2 focus:ring-[#d9d9d9] sm:flex"
+              aria-label={isListening ? "Stop voice input" : "Start voice input"}
+              aria-pressed={isListening}
+              title={isListening ? "Stop voice input" : "Start voice input"}
+            >
+              {isListening ? "■" : "◌"}
+            </button>
+            <button
+              type="submit"
+              disabled={!canSend}
+              className="flex h-9 w-9 items-center justify-center rounded-full bg-[#0d0d0d] text-white shadow-sm transition hover:bg-[#303030] focus:outline-none focus:ring-4 focus:ring-black/10 disabled:cursor-not-allowed disabled:bg-[#d9d9d9] disabled:text-white disabled:shadow-none"
+              aria-label="Send message"
+            >
+              {isSending ? "…" : "↑"}
+            </button>
+          </div>
         </div>
+        {images.length > 0 || pdfs.length > 0 ? (
+          <div className="flex gap-2 overflow-x-auto px-2 pb-2 pt-1">
+            {images.map((image) => (
+              <div
+                key={image.id}
+                className="relative h-16 w-16 shrink-0 overflow-hidden rounded-lg border border-[#d9d9d9] bg-[#f7f7f8]"
+                title={image.name}
+              >
+                <img
+                  src={image.url}
+                  alt={image.name}
+                  className="h-full w-full object-cover"
+                />
+                <button
+                  type="button"
+                  onClick={() => onRemoveImage(image.id)}
+                  className="absolute right-1 top-1 flex h-5 w-5 items-center justify-center rounded-full bg-black/70 text-xs text-white transition hover:bg-black"
+                  aria-label={`Remove ${image.name}`}
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+            {pdfs.map((pdf) => (
+              <div
+                key={pdf.id}
+                className="relative flex h-16 w-36 shrink-0 items-center rounded-lg border border-[#d9d9d9] bg-[#f7f7f8] px-3 pr-7 text-xs text-[#444]"
+                title={pdf.name}
+              >
+                <span className="truncate">{pdf.name}</span>
+                <button
+                  type="button"
+                  onClick={() => onRemovePdf(pdf.id)}
+                  className="absolute right-1 top-1 flex h-5 w-5 items-center justify-center rounded-full bg-black/70 text-xs text-white transition hover:bg-black"
+                  aria-label={`Remove ${pdf.name}`}
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+          </div>
+        ) : null}
       </div>
+      <p className="mt-2 text-center text-[11px] text-[#8a8a8a]">
+        {note || "AI can make mistakes. Check important info."}
+      </p>
     </form>
   );
 }
