@@ -83,6 +83,7 @@ type SpeechRecognitionWindow = Window & {
 
 const exampleTitle = "Candace Voice Chat";
 const STORAGE_KEY = "candace-chat-conversations-v1";
+const SIDEBAR_STORAGE_KEY = "candace-chat-sidebar-v1";
 const CLIENT_MAX_MESSAGES = 512;
 const CLIENT_MAX_MESSAGE_CHARS = 1_000_000;
 const CLIENT_MAX_SYSTEM_PROMPT_CHARS = 300_000;
@@ -294,6 +295,8 @@ export default function ChatApp() {
   const [model, setModel] = useState(DEFAULT_MODEL);
   const [draftModel, setDraftModel] = useState(DEFAULT_MODEL);
   const [requestMode, setRequestMode] = useState<RequestMode>("standard");
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [isListening, setIsListening] = useState(false);
@@ -321,10 +324,15 @@ export default function ChatApp() {
   useEffect(() => {
     try {
       const stored = window.localStorage.getItem(STORAGE_KEY);
+      const storedSidebar = window.localStorage.getItem(SIDEBAR_STORAGE_KEY);
       const parsed = stored ? (JSON.parse(stored) as unknown) : [];
       const saved = Array.isArray(parsed)
         ? sortConversations(parsed.filter(isConversation))
         : [];
+
+      if (storedSidebar) {
+        setSidebarOpen(storedSidebar !== "collapsed");
+      }
 
       if (saved.length > 0) {
         const latest = saved[0];
@@ -352,6 +360,14 @@ export default function ChatApp() {
     if (!hasHydrated) return;
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(conversations));
   }, [conversations, hasHydrated]);
+
+  useEffect(() => {
+    if (!hasHydrated) return;
+    window.localStorage.setItem(
+      SIDEBAR_STORAGE_KEY,
+      sidebarOpen ? "expanded" : "collapsed"
+    );
+  }, [sidebarOpen, hasHydrated]);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({
@@ -947,73 +963,59 @@ export default function ChatApp() {
     startNewChat();
   }
 
+  function openMobileConversation(conversation: Conversation) {
+    openConversation(conversation);
+    setMobileSidebarOpen(false);
+  }
+
+  function startMobileNewChat() {
+    startNewChat();
+    setMobileSidebarOpen(false);
+  }
+
   return (
     <main className="flex h-screen overflow-hidden bg-white text-[#0d0d0d]">
-      <aside className="hidden w-[260px] shrink-0 flex-col border-r border-[#e8e8e8] bg-[#f9f9f9] md:flex">
-        <div className="flex h-full flex-col p-3">
-          <BrandBlock />
-          <div className="mt-4 space-y-1">
-            <SidebarButton
-              label="New chat"
-              icon="✎"
-              onClick={resetChat}
+      {mobileSidebarOpen ? (
+        <div className="fixed inset-0 z-40 md:hidden">
+          <button
+            aria-label="Close sidebar"
+            className="absolute inset-0 bg-black/25"
+            onClick={() => setMobileSidebarOpen(false)}
+          />
+          <aside className="absolute left-0 top-0 flex h-full w-[280px] max-w-[86vw] flex-col border-r border-[#e8e8e8] bg-[#f9f9f9] shadow-[12px_0_40px_rgba(0,0,0,0.12)]">
+            <SidebarPanel
+              conversations={conversations}
+              activeConversationId={activeConversationId}
+              onNewChat={startMobileNewChat}
+              onSettings={() => {
+                setSettingsOpen(true);
+                setMobileSidebarOpen(false);
+              }}
+              onOpenConversation={openMobileConversation}
+              onRenameConversation={renameConversation}
+              onDeleteConversation={deleteConversation}
+              onCollapse={() => setMobileSidebarOpen(false)}
+              collapseLabel="Close sidebar"
             />
-            <SidebarButton
-              label="Settings"
-              icon="⚙"
-              onClick={() => setSettingsOpen(true)}
-            />
-          </div>
-          <div className="mt-6 px-2 text-xs font-semibold text-[#6b6b6b]">
-            Recents
-          </div>
-          <div className="mt-2 min-h-0 flex-1 overflow-y-auto pr-1">
-            {conversations.length === 0 ? (
-              <p className="px-3 py-2 text-sm text-[#8a8a8a]">No chats yet</p>
-            ) : (
-              <div className="space-y-1">
-                {conversations.map((conversation) => (
-                  <div
-                    key={conversation.id}
-                    className={`group flex items-center gap-1 rounded-lg ${
-                      conversation.id === activeConversationId
-                        ? "bg-[#ececec]"
-                        : "hover:bg-[#ececec]"
-                    }`}
-                  >
-                    <button
-                      onClick={() => openConversation(conversation)}
-                      className="min-w-0 flex-1 truncate px-3 py-2 text-left text-sm text-[#404040] focus:outline-none focus:ring-2 focus:ring-[#d9d9d9]"
-                      title={conversation.title}
-                    >
-                      {conversation.title}
-                    </button>
-                    <button
-                      onClick={() => renameConversation(conversation.id)}
-                      className="hidden h-7 w-7 shrink-0 items-center justify-center rounded-md text-[#777] transition hover:bg-[#dedede] hover:text-[#111] group-hover:flex"
-                      aria-label={`Rename ${conversation.title}`}
-                      title="Rename"
-                    >
-                      ✎
-                    </button>
-                    <button
-                      onClick={() => deleteConversation(conversation.id)}
-                      className="mr-1 hidden h-7 w-7 shrink-0 items-center justify-center rounded-md text-[#777] transition hover:bg-[#dedede] hover:text-[#111] group-hover:flex"
-                      aria-label={`Delete ${conversation.title}`}
-                      title="Delete"
-                    >
-                      ×
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-          <div className="mt-auto rounded-xl px-3 py-2 text-xs text-[#777]">
-            Apple Lamps
-          </div>
+          </aside>
         </div>
-      </aside>
+      ) : null}
+
+      {sidebarOpen ? (
+        <aside className="hidden w-[260px] shrink-0 flex-col border-r border-[#e8e8e8] bg-[#f9f9f9] md:flex">
+          <SidebarPanel
+            conversations={conversations}
+            activeConversationId={activeConversationId}
+            onNewChat={resetChat}
+            onSettings={() => setSettingsOpen(true)}
+            onOpenConversation={openConversation}
+            onRenameConversation={renameConversation}
+            onDeleteConversation={deleteConversation}
+            onCollapse={() => setSidebarOpen(false)}
+            collapseLabel="Collapse sidebar"
+          />
+        </aside>
+      ) : null}
 
       <section className="relative flex min-w-0 flex-1 flex-col bg-white">
           <Header
@@ -1023,6 +1025,9 @@ export default function ChatApp() {
             onShare={shareConversation}
             canShare={messages.length > 0}
             shareStatus={shareStatus}
+            sidebarOpen={sidebarOpen}
+            onToggleSidebar={() => setSidebarOpen((current) => !current)}
+            onOpenMobileSidebar={() => setMobileSidebarOpen(true)}
           />
 
           <div
@@ -1115,6 +1120,108 @@ export default function ChatApp() {
   );
 }
 
+function SidebarPanel({
+  conversations,
+  activeConversationId,
+  onNewChat,
+  onSettings,
+  onOpenConversation,
+  onRenameConversation,
+  onDeleteConversation,
+  onCollapse,
+  collapseLabel
+}: {
+  conversations: Conversation[];
+  activeConversationId: string;
+  onNewChat: () => void;
+  onSettings: () => void;
+  onOpenConversation: (conversation: Conversation) => void;
+  onRenameConversation: (id: string) => void;
+  onDeleteConversation: (id: string) => void;
+  onCollapse: () => void;
+  collapseLabel: string;
+}) {
+  return (
+    <div className="flex h-full min-h-0 flex-col p-3">
+      <div className="flex items-center justify-between gap-2">
+        <BrandBlock />
+        <button
+          onClick={onCollapse}
+          className="flex h-8 w-8 items-center justify-center rounded-lg text-[#555] transition hover:bg-[#ececec] hover:text-[#111] focus:outline-none focus:ring-2 focus:ring-[#d9d9d9]"
+          aria-label={collapseLabel}
+          title={collapseLabel}
+        >
+          ◧
+        </button>
+      </div>
+
+      <div className="mt-4 space-y-1">
+        <SidebarButton label="New chat" icon="✎" onClick={onNewChat} />
+        <SidebarButton label="Settings" icon="⚙" onClick={onSettings} />
+      </div>
+
+      <div className="mt-6 px-2 text-xs font-semibold text-[#6b6b6b]">
+        Recents
+      </div>
+
+      <div className="mt-2 min-h-0 flex-1 overflow-y-auto pr-1">
+        {conversations.length === 0 ? (
+          <p className="px-3 py-2 text-sm text-[#8a8a8a]">No chats yet</p>
+        ) : (
+          <div className="space-y-1">
+            {conversations.map((conversation) => (
+              <div
+                key={conversation.id}
+                className={`group flex items-center gap-1 rounded-lg ${
+                  conversation.id === activeConversationId
+                    ? "bg-[#ececec]"
+                    : "hover:bg-[#ececec]"
+                }`}
+              >
+                <button
+                  onClick={() => onOpenConversation(conversation)}
+                  className="min-w-0 flex-1 truncate px-3 py-2 text-left text-sm text-[#404040] focus:outline-none focus:ring-2 focus:ring-[#d9d9d9]"
+                  title={conversation.title}
+                >
+                  {conversation.title}
+                </button>
+                <button
+                  onClick={() => onRenameConversation(conversation.id)}
+                  className="hidden h-7 w-7 shrink-0 items-center justify-center rounded-md text-[#777] transition hover:bg-[#dedede] hover:text-[#111] group-hover:flex"
+                  aria-label={`Rename ${conversation.title}`}
+                  title="Rename"
+                >
+                  ✎
+                </button>
+                <button
+                  onClick={() => onDeleteConversation(conversation.id)}
+                  className="mr-1 hidden h-7 w-7 shrink-0 items-center justify-center rounded-md text-[#777] transition hover:bg-[#dedede] hover:text-[#111] group-hover:flex"
+                  aria-label={`Delete ${conversation.title}`}
+                  title="Delete"
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div className="mt-auto border-t border-[#ececec] px-2 pt-3">
+        <div className="flex items-center gap-2 rounded-lg px-2 py-2">
+          <div className="flex h-7 w-7 items-center justify-center rounded-full bg-[#0d0d0d] text-xs font-semibold text-white">
+            A
+          </div>
+          <div className="min-w-0">
+            <p className="truncate text-sm text-[#333]">Apple Lamps</p>
+            <p className="text-xs text-[#8a8a8a]">Pro</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function BrandBlock() {
   return (
     <div>
@@ -1157,7 +1264,10 @@ function Header({
   onReset,
   onShare,
   canShare,
-  shareStatus
+  shareStatus,
+  sidebarOpen,
+  onToggleSidebar,
+  onOpenMobileSidebar
 }: {
   model: string;
   onOpenSettings: () => void;
@@ -1165,10 +1275,31 @@ function Header({
   onShare: () => void;
   canShare: boolean;
   shareStatus: string | null;
+  sidebarOpen: boolean;
+  onToggleSidebar: () => void;
+  onOpenMobileSidebar: () => void;
 }) {
   return (
     <header className="flex h-14 items-center justify-between gap-3 bg-white px-3 sm:px-5">
       <div className="flex min-w-0 items-center gap-2">
+        <button
+          onClick={onOpenMobileSidebar}
+          className="flex h-9 w-9 items-center justify-center rounded-lg text-[#444] transition hover:bg-[#f2f2f2] focus:outline-none focus:ring-2 focus:ring-[#d9d9d9] md:hidden"
+          aria-label="Open sidebar"
+          title="Open sidebar"
+        >
+          ◧
+        </button>
+        {!sidebarOpen ? (
+          <button
+            onClick={onToggleSidebar}
+            className="hidden h-9 w-9 items-center justify-center rounded-lg text-[#444] transition hover:bg-[#f2f2f2] focus:outline-none focus:ring-2 focus:ring-[#d9d9d9] md:flex"
+            aria-label="Open sidebar"
+            title="Open sidebar"
+          >
+            ◧
+          </button>
+        ) : null}
         <button
           onClick={onReset}
           className="rounded-lg px-3 py-2 text-sm font-medium text-[#444] transition hover:bg-[#f2f2f2] focus:outline-none focus:ring-2 focus:ring-[#d9d9d9] md:hidden"
@@ -1244,11 +1375,56 @@ function MessageBubble({
   onRetry: () => void;
 }) {
   const isUser = message.role === "user";
+  const imageAttachments = message.imageAttachments || [];
+  const pdfAttachments = message.pdfAttachments || [];
+  const hasImageAttachments = imageAttachments.length > 0;
+  const hasPdfAttachments = pdfAttachments.length > 0;
+
   return (
     <article
       className={`group flex ${isUser ? "justify-end" : "justify-start"}`}
     >
       <div className={`${isUser ? "max-w-[78%]" : "w-full max-w-3xl"}`}>
+        {isUser && (hasImageAttachments || hasPdfAttachments) ? (
+          <div className="mb-2 flex flex-col items-end gap-2">
+            {hasImageAttachments ? (
+              <div className="grid max-w-[340px] grid-cols-1 gap-2">
+                {imageAttachments.map((image) => (
+                  <img
+                    key={image.id}
+                    src={image.url}
+                    alt={image.name}
+                    className="max-h-64 w-full rounded-[1.35rem] object-cover"
+                  />
+                ))}
+              </div>
+            ) : null}
+            {hasPdfAttachments ? (
+              <div className="flex max-w-[340px] flex-col gap-2">
+                {pdfAttachments.map((pdf) => (
+                  <a
+                    key={pdf.id}
+                    href={pdf.url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="flex min-w-0 items-center gap-3 rounded-xl border border-[#e5e5e5] bg-white px-3 py-2.5 text-left text-sm text-[#111] shadow-sm transition hover:bg-[#f7f7f8]"
+                  >
+                    <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-[#ff4f45] text-xs font-bold text-white">
+                      PDF
+                    </span>
+                    <span className="min-w-0">
+                      <span className="block truncate font-medium">
+                        {pdf.name}
+                      </span>
+                      <span className="text-xs text-[#777]">PDF</span>
+                    </span>
+                  </a>
+                ))}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+
         <div className={isUser ? "flex justify-end" : "flex justify-start"}>
           <div
             className={
@@ -1260,29 +1436,18 @@ function MessageBubble({
             }
           >
             <MarkdownMessage content={message.content} isUser={isUser} />
-            {message.imageAttachments?.length ? (
-              <div className="mt-3 grid grid-cols-2 gap-2">
-                {message.imageAttachments.map((image) => (
-                  <img
-                    key={image.id}
-                    src={image.url}
-                    alt={image.name}
-                    className="max-h-48 rounded-xl object-cover"
-                  />
-                ))}
-              </div>
-            ) : null}
-            {message.pdfAttachments?.length ? (
+            {!isUser && hasPdfAttachments ? (
               <div className="mt-3 flex flex-col gap-2">
-                {message.pdfAttachments.map((pdf) => (
+                {pdfAttachments.map((pdf) => (
                   <a
                     key={pdf.id}
                     href={pdf.url}
                     target="_blank"
                     rel="noreferrer"
-                    className="rounded-lg border border-white/20 bg-white/10 px-3 py-2 text-sm underline-offset-4 hover:underline"
+                    className="inline-flex max-w-xs items-center gap-2 rounded-md bg-[#f2f2f2] px-2 py-1 text-xs text-[#555] underline-offset-4 hover:underline"
                   >
-                    {pdf.name}
+                    <span>▯</span>
+                    <span className="truncate">{pdf.name}</span>
                   </a>
                 ))}
               </div>
@@ -1433,6 +1598,54 @@ function Composer({
   return (
     <form onSubmit={onSubmit} className="mx-auto max-w-3xl">
       <div className="rounded-[1.75rem] border border-[#d9d9d9] bg-white p-2 shadow-[0_8px_30px_rgba(0,0,0,0.10)] transition focus-within:border-[#bdbdbd]">
+        {images.length > 0 || pdfs.length > 0 ? (
+          <div className="flex gap-2 overflow-x-auto px-2 pb-2 pt-1">
+            {images.map((image) => (
+              <div
+                key={image.id}
+                className="relative h-28 w-28 shrink-0 overflow-hidden rounded-xl border border-[#d9d9d9] bg-[#f7f7f8]"
+                title={image.name}
+              >
+                <img
+                  src={image.url}
+                  alt={image.name}
+                  className="h-full w-full object-cover"
+                />
+                <button
+                  type="button"
+                  onClick={() => onRemoveImage(image.id)}
+                  className="absolute right-1.5 top-1.5 flex h-6 w-6 items-center justify-center rounded-full bg-black/75 text-sm text-white transition hover:bg-black"
+                  aria-label={`Remove ${image.name}`}
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+            {pdfs.map((pdf) => (
+              <div
+                key={pdf.id}
+                className="relative flex h-16 w-72 max-w-[80vw] shrink-0 items-center gap-3 rounded-xl border border-[#d9d9d9] bg-[#f7f7f8] px-3 pr-9 text-sm text-[#222]"
+                title={pdf.name}
+              >
+                <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-[#ff4f45] text-xs font-bold text-white">
+                  PDF
+                </span>
+                <span className="min-w-0">
+                  <span className="block truncate font-medium">{pdf.name}</span>
+                  <span className="text-xs text-[#777]">PDF</span>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => onRemovePdf(pdf.id)}
+                  className="absolute right-2 top-2 flex h-6 w-6 items-center justify-center rounded-full bg-black/75 text-sm text-white transition hover:bg-black"
+                  aria-label={`Remove ${pdf.name}`}
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+          </div>
+        ) : null}
         <textarea
           ref={inputRef}
           value={value}
@@ -1499,48 +1712,6 @@ function Composer({
             </button>
           </div>
         </div>
-        {images.length > 0 || pdfs.length > 0 ? (
-          <div className="flex gap-2 overflow-x-auto px-2 pb-2 pt-1">
-            {images.map((image) => (
-              <div
-                key={image.id}
-                className="relative h-16 w-16 shrink-0 overflow-hidden rounded-lg border border-[#d9d9d9] bg-[#f7f7f8]"
-                title={image.name}
-              >
-                <img
-                  src={image.url}
-                  alt={image.name}
-                  className="h-full w-full object-cover"
-                />
-                <button
-                  type="button"
-                  onClick={() => onRemoveImage(image.id)}
-                  className="absolute right-1 top-1 flex h-5 w-5 items-center justify-center rounded-full bg-black/70 text-xs text-white transition hover:bg-black"
-                  aria-label={`Remove ${image.name}`}
-                >
-                  ×
-                </button>
-              </div>
-            ))}
-            {pdfs.map((pdf) => (
-              <div
-                key={pdf.id}
-                className="relative flex h-16 w-36 shrink-0 items-center rounded-lg border border-[#d9d9d9] bg-[#f7f7f8] px-3 pr-7 text-xs text-[#444]"
-                title={pdf.name}
-              >
-                <span className="truncate">{pdf.name}</span>
-                <button
-                  type="button"
-                  onClick={() => onRemovePdf(pdf.id)}
-                  className="absolute right-1 top-1 flex h-5 w-5 items-center justify-center rounded-full bg-black/70 text-xs text-white transition hover:bg-black"
-                  aria-label={`Remove ${pdf.name}`}
-                >
-                  ×
-                </button>
-              </div>
-            ))}
-          </div>
-        ) : null}
       </div>
       <p className="mt-2 text-center text-[11px] text-[#8a8a8a]">
         {note || "AI can make mistakes. Check important info."}
